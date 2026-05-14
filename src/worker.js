@@ -950,7 +950,7 @@ async function handleGenerate(req, env) {
   const body = (form.get('body') || '').trim();
 
   if (!entityId || !body) {
-    return Response.redirect('/brief?msg=error', 303);
+    return redirect(req, '/brief?msg=error', 303);
   }
 
   const entity = await env.DB.prepare('SELECT id FROM entities WHERE id=?').bind(entityId).first();
@@ -972,7 +972,7 @@ async function handleGenerate(req, env) {
     });
   }
 
-  return Response.redirect(`/progress/${briefId}`, 303);
+  return redirect(req, `/progress/${briefId}`, 303);
 }
 
 async function handleBriefStatus(briefId, env) {
@@ -1037,14 +1037,14 @@ async function handleAddJournalist(req, env) {
   const beats = form.getAll('beats').filter(b => KNOWN_BEATS.includes(b));
 
   if (!name || !email || !publication) {
-    return Response.redirect('/journalists?msg=error', 303);
+    return redirect(req, '/journalists?msg=error', 303);
   }
 
   await env.DB.prepare(
     'INSERT OR IGNORE INTO journalists (id, name, email, publication, beat_keywords, last_contacted_at) VALUES (?,?,?,?,?,?)'
   ).bind(uid(), name, email, publication, JSON.stringify(beats), null).run();
 
-  return Response.redirect('/journalists?msg=added', 303);
+  return redirect(req, '/journalists?msg=added', 303);
 }
 
 async function handleDeleteJournalist(journalistId, env) {
@@ -1128,6 +1128,11 @@ function json(data, status = 200) {
   });
 }
 
+function redirect(req, path, status = 302) {
+  const base = new URL(req.url).origin;
+  return Response.redirect(base + path, status);
+}
+
 function esc(str) {
   return String(str || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
@@ -1169,7 +1174,7 @@ export default {
     const method = req.method;
 
     // Pages
-    if (path === '/' || path === '') return Response.redirect('/brief', 302);
+    if (path === '/' || path === '') return redirect(req, '/brief', 302);
     if (path === '/brief') return briefPage(req, env);
     if (path === '/queue') return queuePage(req, env);
     if (path === '/coverage') return coveragePage(req, env);
