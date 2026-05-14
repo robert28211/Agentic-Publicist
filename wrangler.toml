@@ -1,0 +1,39 @@
+name = "publicist"
+main = "src/worker.js"
+compatibility_date = "2025-05-14"
+compatibility_flags = ["nodejs_compat"]
+
+# Create D1 database: wrangler d1 create publicist
+# Then paste the database_id below
+[[d1_databases]]
+binding = "DB"
+database_name = "publicist"
+database_id = "REPLACE_WITH_D1_DATABASE_ID"
+
+# Create queue: wrangler queues create publicist-pipeline
+[[queues.producers]]
+binding = "PIPELINE_QUEUE"
+queue = "publicist-pipeline"
+
+[[queues.consumers]]
+queue = "publicist-pipeline"
+max_batch_size = 1
+max_batch_timeout = 30
+max_retries = 3
+dead_letter_queue = "publicist-pipeline-dlq"
+
+[vars]
+# Non-secret config
+APP_ENV = "production"
+
+# Secrets — set with: wrangler secret put <NAME>
+# ANTHROPIC_API_KEY
+# HUNTER_API_KEY
+# RESEND_API_KEY
+# RESEND_WEBHOOK_SECRET  (from Resend dashboard → Webhooks → Signing secret)
+# TELEGRAM_BOT_TOKEN
+# TELEGRAM_CHAT_ID
+
+# Cloudflare Access protects all routes at the account level.
+# Configure in Zero Trust dashboard → Access → Applications → Add application.
+# No auth code needed in the Worker.

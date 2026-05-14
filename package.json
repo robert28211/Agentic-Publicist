@@ -1,0 +1,22 @@
+{
+  "name": "agentic-publicist",
+  "version": "1.0.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "db:init": "wrangler d1 execute publicist --local --file=schema.sql",
+    "db:seed": "wrangler d1 execute publicist --local --file=seed.sql",
+    "db:init:remote": "wrangler d1 execute publicist --file=schema.sql",
+    "db:seed:remote": "wrangler d1 execute publicist --file=seed.sql"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "^0.8.0",
+    "@cloudflare/workers-types": "^4.20250508.0",
+    "vitest": "^3.1.0",
+    "wrangler": "^4.0.0"
+  }
+}
