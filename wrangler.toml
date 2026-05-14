@@ -28,7 +28,6 @@ APP_ENV = "production"
 
 # Secrets — set with: wrangler secret put <NAME>
 # ANTHROPIC_API_KEY
-# HUNTER_API_KEY
 # RESEND_API_KEY
 # RESEND_WEBHOOK_SECRET  (from Resend dashboard → Webhooks → Signing secret)
 # TELEGRAM_BOT_TOKEN

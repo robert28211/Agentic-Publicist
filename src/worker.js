@@ -1,20 +1,26 @@
 // Agentic Publicist — Single Cloudflare Worker
 // Auth: Cloudflare Access (Zero Trust) — no auth code needed here
 // Async pipeline: Queue Consumer handles brief → angles → pitches
+//
+// Journalist discovery: journalists are curated directly in D1 (not discovered
+// via Hunter.io domain search). BEAT_KEYWORDS on each journalist row determines
+// which angles they're matched to. Add journalists via the /journalists page.
 
 // ============================================================
 // CONSTANTS
 // ============================================================
 
-export const BEAT_DOMAINS = {
-  'marketing-tech': ['techcrunch.com', 'marketingland.com', 'searchengineland.com', 'adweek.com'],
-  'home-services': ['contractortalk.com', 'remodeling.hw.net', 'probuilder.com', 'housingwire.com'],
-  'ai-automation': ['venturebeat.com', 'zdnet.com', 'the-decoder.com', 'artificialintelligence-news.com'],
-  'flooring-industry': ['floorcoveringnews.net', 'floordaily.net', 'fcnews.net'],
-  'small-business': ['entrepreneur.com', 'inc.com', 'businessinsider.com', 'forbes.com'],
-  'digital-marketing': ['searchengineland.com', 'marketingland.com', 'adweek.com', 'digiday.com'],
-  'construction': ['constructiondive.com', 'enr.com', 'contractingbusiness.com'],
-};
+// Canonical beat names used in angle generation and journalist matching.
+// These are labels, not domain lists. The journalist DB is the source of truth.
+export const KNOWN_BEATS = [
+  'marketing-tech',
+  'home-services',
+  'ai-automation',
+  'flooring-industry',
+  'small-business',
+  'digital-marketing',
+  'construction',
+];
 
 const THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1000;
 
@@ -44,8 +50,20 @@ export function filterEligibleJournalists(journalists) {
   );
 }
 
-export function getDomainsForBeat(beat) {
-  return BEAT_DOMAINS[beat] || [];
+// Find journalists from D1 whose beat_keywords overlap with an angle's beat.
+// beat_keywords is a JSON array on each journalist row (e.g. ["marketing-tech","ai-automation"]).
+export async function getJournalistsForBeat(beat, db) {
+  // Pull all journalists — D1 has no JSON array search, so filter in JS.
+  // Cap at 200 rows; the journalist DB stays small and curated.
+  const rows = await db.prepare('SELECT * FROM journalists LIMIT 200').all().then(r => r.results || []);
+  return rows.filter(j => {
+    try {
+      const keywords = JSON.parse(j.beat_keywords || '[]');
+      return keywords.includes(beat);
+    } catch {
+      return false;
+    }
+  });
 }
 
 // ============================================================
@@ -174,28 +192,6 @@ Reply with exactly one word: positive, neutral, or negative.`
 }
 
 // ============================================================
-// HUNTER.IO
-// ============================================================
-
-async function hunterDomainSearch(domain, env) {
-  if (!env.HUNTER_API_KEY) return [];
-  const url = `https://api.hunter.io/v2/domain-search?domain=${encodeURIComponent(domain)}&type=journalist&limit=5&api_key=${env.HUNTER_API_KEY}`;
-  try {
-    const res = await fetch(url);
-    if (!res.ok) return [];
-    const data = await res.json();
-    return (data.data?.emails || []).map(e => ({
-      name: `${e.first_name || ''} ${e.last_name || ''}`.trim() || 'Unknown',
-      email: e.value,
-      publication: domain,
-      position: e.position || '',
-    }));
-  } catch {
-    return [];
-  }
-}
-
-// ============================================================
 // GOOGLE NEWS RSS
 // ============================================================
 
@@ -310,7 +306,7 @@ async function processBrief(message, env) {
   let steps = [
     { step: 'Analyzing brief', done: false, ts: null },
     { step: 'Generating story angles', done: false, ts: null },
-    { step: 'Searching journalists', done: false, ts: null },
+    { step: 'Matching journalists by beat', done: false, ts: null },
     { step: 'Drafting pitches', done: false, ts: null },
   ];
 
@@ -329,47 +325,25 @@ async function processBrief(message, env) {
     await db.prepare('UPDATE briefs SET angles=? WHERE id=?')
       .bind(JSON.stringify(angles), briefId).run();
 
-    // Step 3: Journalist discovery (per angle, parallel)
+    // Step 3: Match journalists from D1 by beat (no external API — curated DB)
     steps[2].done = true; steps[2].ts = now();
     await updateProgress(steps);
 
-    const journalistResults = await Promise.allSettled(
-      angles.flatMap(angle => {
-        const domains = getDomainsForBeat(angle.beat);
-        return domains.map(domain => hunterDomainSearch(domain, env));
-      })
-    );
-
-    // Collect and dedup by email
-    const emailSeen = new Set();
-    const rawJournalists = journalistResults
+    // Pull journalists for each angle's beat, dedup by id
+    const idSeen = new Set();
+    const allMatched = (await Promise.allSettled(
+      angles.map(angle => getJournalistsForBeat(angle.beat, db))
+    ))
       .filter(r => r.status === 'fulfilled')
       .flatMap(r => r.value)
       .filter(j => {
-        if (!j.email || emailSeen.has(j.email)) return false;
-        emailSeen.add(j.email);
+        if (idSeen.has(j.id)) return false;
+        idSeen.add(j.id);
         return true;
       });
 
-    // Upsert journalists into D1
-    for (const j of rawJournalists) {
-      const existing = await db.prepare('SELECT id, last_contacted_at FROM journalists WHERE email=?').bind(j.email).first();
-      if (!existing) {
-        await db.prepare(
-          'INSERT INTO journalists (id, name, email, publication, beat_keywords, last_contacted_at) VALUES (?,?,?,?,?,?)'
-        ).bind(uid(), j.name, j.email, j.publication, JSON.stringify([]), null).run();
-      }
-    }
-
-    // Fetch from D1 (includes last_contacted_at)
-    const allJournalists = rawJournalists.length
-      ? await db.prepare(
-          `SELECT * FROM journalists WHERE email IN (${rawJournalists.map(() => '?').join(',')}) LIMIT 20`
-        ).bind(...rawJournalists.map(j => j.email)).all().then(r => r.results)
-      : [];
-
     // Filter by 30-day cooldown (cross-brief rate limiting)
-    const eligible = filterEligibleJournalists(allJournalists);
+    const eligible = filterEligibleJournalists(allMatched);
 
     if (!eligible.length) {
       await db.prepare("UPDATE briefs SET status='complete' WHERE id=?").bind(briefId).run();
@@ -521,6 +495,7 @@ function shell(title, body, activeTab, queueCount = 0) {
     { href: '/brief', label: 'Brief', key: 'brief' },
     { href: '/queue', label: `Queue${queueCount ? `<span class="badge">${queueCount}</span>` : ''}`, key: 'queue' },
     { href: '/coverage', label: 'Coverage', key: 'coverage' },
+    { href: '/journalists', label: 'Journalists', key: 'journalists' },
   ];
 
   const navLinks = tabs.map(t =>
@@ -857,6 +832,115 @@ poll();
 }
 
 // ============================================================
+// PAGE: /journalists
+// ============================================================
+
+async function journalistsPage(req, env) {
+  const db = env.DB;
+  const url = new URL(req.url);
+  const msg = url.searchParams.get('msg');
+
+  const journalists = await db.prepare(
+    'SELECT * FROM journalists ORDER BY publication, name LIMIT 200'
+  ).all().then(r => r.results || []);
+
+  const msgHtml = msg === 'added'
+    ? '<div class="alert alert-success">Journalist added.</div>'
+    : msg === 'deleted'
+    ? '<div class="alert alert-success">Journalist removed.</div>'
+    : '';
+
+  const beatOptions = KNOWN_BEATS.map(b =>
+    `<option value="${b}">${b}</option>`
+  ).join('');
+
+  const rows = journalists.length ? journalists.map(j => {
+    const beats = JSON.parse(j.beat_keywords || '[]');
+    const lastContact = j.last_contacted_at ? relativeTime(j.last_contacted_at) : 'Never';
+    return `
+<tr>
+  <td style="font-weight:600">${esc(j.name)}</td>
+  <td>${esc(j.publication)}</td>
+  <td>${esc(j.email)}</td>
+  <td>${beats.map(b => `<span class="pitch-angle" style="margin-right:4px">${esc(b)}</span>`).join('')}</td>
+  <td class="muted">${lastContact}</td>
+  <td>
+    <button class="btn btn-ghost btn-sm" style="color:var(--red);border-color:var(--red)"
+      onclick="deleteJournalist('${j.id}')">Remove</button>
+  </td>
+</tr>`;
+  }).join('') : `<tr><td colspan="6" style="text-align:center;padding:40px;color:var(--dim)">No journalists yet. Add your first one below.</td></tr>`;
+
+  const body = `
+<div class="page-wide">
+  ${msgHtml}
+  <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:24px">
+    <div>
+      <h2 style="margin:0">Journalist Database</h2>
+      <p class="muted" style="margin-top:4px">${journalists.length} journalist${journalists.length !== 1 ? 's' : ''} · curated, no external API</p>
+    </div>
+  </div>
+
+  <div class="card" style="margin-bottom:28px">
+    <h3 style="margin-bottom:16px;font-size:15px">Add Journalist</h3>
+    <form method="POST" action="/api/journalists" style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
+      <div class="form-group" style="margin:0">
+        <label>Name</label>
+        <input type="text" name="name" required placeholder="Jane Smith"
+          style="width:100%;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:14px;padding:9px 12px;outline:none">
+      </div>
+      <div class="form-group" style="margin:0">
+        <label>Email</label>
+        <input type="email" name="email" required placeholder="jane@techcrunch.com"
+          style="width:100%;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:14px;padding:9px 12px;outline:none">
+      </div>
+      <div class="form-group" style="margin:0">
+        <label>Publication</label>
+        <input type="text" name="publication" required placeholder="TechCrunch"
+          style="width:100%;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:14px;padding:9px 12px;outline:none">
+      </div>
+      <div class="form-group" style="margin:0">
+        <label>Beats (hold ⌘/Ctrl to select multiple)</label>
+        <select name="beats" multiple size="3"
+          style="width:100%;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:13px;padding:6px 10px;outline:none">
+          ${beatOptions}
+        </select>
+      </div>
+      <div style="grid-column:1/-1">
+        <button type="submit" class="btn btn-primary btn-sm">Add Journalist</button>
+      </div>
+    </form>
+  </div>
+
+  <table style="width:100%;border-collapse:collapse">
+    <thead>
+      <tr style="border-bottom:1px solid var(--border)">
+        <th style="text-align:left;padding:8px 0;font-size:12px;color:var(--dim);font-weight:600">NAME</th>
+        <th style="text-align:left;padding:8px 0;font-size:12px;color:var(--dim);font-weight:600">PUBLICATION</th>
+        <th style="text-align:left;padding:8px 0;font-size:12px;color:var(--dim);font-weight:600">EMAIL</th>
+        <th style="text-align:left;padding:8px 0;font-size:12px;color:var(--dim);font-weight:600">BEATS</th>
+        <th style="text-align:left;padding:8px 0;font-size:12px;color:var(--dim);font-weight:600">LAST CONTACT</th>
+        <th></th>
+      </tr>
+    </thead>
+    <tbody>${rows}</tbody>
+  </table>
+</div>
+<script>
+async function deleteJournalist(id) {
+  if (!confirm('Remove this journalist?')) return;
+  const res = await fetch('/api/journalists/' + id, { method: 'DELETE' });
+  if (res.ok) location.href = '/journalists?msg=deleted';
+}
+</script>`;
+
+  const queueCount = await pendingPitchCount(db);
+  return new Response(shell('Journalists', body, 'journalists', queueCount), {
+    headers: { 'Content-Type': 'text/html;charset=UTF-8' },
+  });
+}
+
+// ============================================================
 // API HANDLERS
 // ============================================================
 
@@ -943,6 +1027,29 @@ async function handleSend(env) {
 
   await telegram(`📨 ${sent} pitch${sent !== 1 ? 'es' : ''} sent`, env);
   return json({ sent });
+}
+
+async function handleAddJournalist(req, env) {
+  const form = await req.formData();
+  const name = (form.get('name') || '').trim();
+  const email = (form.get('email') || '').trim().toLowerCase();
+  const publication = (form.get('publication') || '').trim();
+  const beats = form.getAll('beats').filter(b => KNOWN_BEATS.includes(b));
+
+  if (!name || !email || !publication) {
+    return Response.redirect('/journalists?msg=error', 303);
+  }
+
+  await env.DB.prepare(
+    'INSERT OR IGNORE INTO journalists (id, name, email, publication, beat_keywords, last_contacted_at) VALUES (?,?,?,?,?,?)'
+  ).bind(uid(), name, email, publication, JSON.stringify(beats), null).run();
+
+  return Response.redirect('/journalists?msg=added', 303);
+}
+
+async function handleDeleteJournalist(journalistId, env) {
+  await env.DB.prepare('DELETE FROM journalists WHERE id=?').bind(journalistId).run();
+  return json({ ok: true });
 }
 
 async function handleResendWebhook(req, env) {
@@ -1066,6 +1173,7 @@ export default {
     if (path === '/brief') return briefPage(req, env);
     if (path === '/queue') return queuePage(req, env);
     if (path === '/coverage') return coveragePage(req, env);
+    if (path === '/journalists') return journalistsPage(req, env);
 
     const progressMatch = path.match(/^\/progress\/([^/]+)$/);
     if (progressMatch) return progressPage(progressMatch[1], env);
@@ -1078,6 +1186,10 @@ export default {
 
     const pitchMatch = path.match(/^\/api\/pitches\/([^/]+)\/(approve|skip)$/);
     if (pitchMatch && method === 'POST') return handlePitchAction(pitchMatch[1], pitchMatch[2], env);
+
+    if (path === '/api/journalists' && method === 'POST') return handleAddJournalist(req, env);
+    const journalistDeleteMatch = path.match(/^\/api\/journalists\/([^/]+)$/);
+    if (journalistDeleteMatch && method === 'DELETE') return handleDeleteJournalist(journalistDeleteMatch[1], env);
 
     if (path === '/api/send' && method === 'POST') return handleSend(env);
     if (path === '/api/webhook/resend' && method === 'POST') return handleResendWebhook(req, env);
