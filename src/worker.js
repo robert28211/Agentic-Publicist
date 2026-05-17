@@ -20,6 +20,8 @@ export const KNOWN_BEATS = [
   'small-business',
   'digital-marketing',
   'construction',
+  'sc-local',       // SC local news reporters (The State, TV stations)
+  'local-business', // Business reporters at local SC outlets
 ];
 
 const THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1000;
@@ -121,7 +123,7 @@ Today's date: ${new Date().toISOString().split('T')[0]}
 Top headlines today: ${headlines.join(' | ')}
 
 Return a JSON array of exactly 3 story angles:
-[{"angle": "string", "beat": "one of: marketing-tech|home-services|ai-automation|flooring-industry|small-business|digital-marketing|construction", "publication_type": "string"}]`;
+[{"angle": "string", "beat": "one of: marketing-tech|home-services|ai-automation|flooring-industry|small-business|digital-marketing|construction|sc-local|local-business", "publication_type": "string"}]`;
 
   const text = await callClaude(
     [{ role: 'user', content: user }],
