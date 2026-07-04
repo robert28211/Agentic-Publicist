@@ -1158,12 +1158,57 @@ async function pendingPitchCount(db) {
   return row?.n || 0;
 }
 
+// ===== EngageEngine shared password-session gate (canonical) =====
+async function eeSign(env, msg) {
+  const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(env.SESSION_SIGNING_KEY || ""), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const sig = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(msg));
+  return btoa(String.fromCharCode(...new Uint8Array(sig))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+async function eeIssue(env) { const exp = Date.now() + 30 * 864e5; return exp + "." + await eeSign(env, "ee:" + exp); }
+async function eeValid(env, tok) {
+  if (!tok) return false;
+  const i = tok.lastIndexOf(".");
+  if (i < 1) return false;
+  const exp = tok.slice(0, i), sig = tok.slice(i + 1);
+  if (!/^\d+$/.test(exp) || Number(exp) < Date.now()) return false;
+  return sig === await eeSign(env, "ee:" + exp);
+}
+function eeCookie(req, name) {
+  const h = req.headers.get("Cookie") || "";
+  const m = h.split(";").map((s) => s.trim()).find((s) => s.startsWith(name + "="));
+  return m ? m.slice(name.length + 1) : null;
+}
+function eeLoginPage(ret, err) {
+  const body = `<!doctype html><meta name=viewport content="width=device-width,initial-scale=1"><title>EngageEngine — Sign In</title><style>body{font-family:'DM Sans',system-ui,sans-serif;background:#F5F3EE;color:#1C1917;display:grid;place-items:center;min-height:100vh;margin:0}form{background:#fff;border:1px solid #E2DED5;border-radius:12px;padding:32px;width:320px;box-shadow:0 2px 12px rgba(0,0,0,.05)}h1{font-size:16px;margin:0 0 4px;letter-spacing:.04em}p{color:#78716C;font-size:13px;margin:0 0 20px}input{width:100%;padding:10px;border:1px solid #E2DED5;border-radius:8px;font-size:14px;margin-bottom:12px;box-sizing:border-box}button{width:100%;padding:10px;background:#CF6344;color:#fff;border:0;border-radius:8px;font-weight:600;font-size:14px;cursor:pointer}.err{color:#DC2626;font-size:12px;margin-bottom:10px}</style><form method=POST action="/ee-login?return=${encodeURIComponent(ret)}"><h1>ENGAGE|ENGINE</h1><p>Enter the team password to continue.</p>${err ? '<div class=err>' + err + '</div>' : ''}<input type=password name=password autofocus placeholder="Password"><button>Sign in</button></form>`;
+  return new Response(body, { status: 401, headers: { "Content-Type": "text/html; charset=utf-8" } });
+}
+async function eeGate(request, env, publicRes) {
+  const url = new URL(request.url);
+  if (url.pathname === "/ee-login" && request.method === "POST") {
+    const form = await request.formData();
+    const ret = url.searchParams.get("return") || "/";
+    if ((form.get("password") || "") === env.APP_PASSWORD) {
+      const tok = await eeIssue(env);
+      return new Response(null, { status: 302, headers: { "Location": ret, "Set-Cookie": `ee_session=${tok}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=2592000` } });
+    }
+    return eeLoginPage(ret, "Incorrect password");
+  }
+  if ((publicRes || []).some((re) => re.test(url.pathname))) return null;
+  if (await eeValid(env, eeCookie(request, "ee_session"))) return null;
+  const accept = request.headers.get("Accept") || "";
+  if (accept.includes("text/html")) return eeLoginPage(url.pathname + url.search, "");
+  return new Response(JSON.stringify({ error: "Authentication required" }), { status: 401, headers: { "Content-Type": "application/json" } });
+}
+
 // ============================================================
 // MAIN EXPORT
 // ============================================================
 
 export default {
   async fetch(req, env) {
+    const eeBlocked = await eeGate(req, env, [/^\/api\/webhook\/resend$/, /^\/api\/health$/]);
+    if (eeBlocked) return eeBlocked;
+
     // Validate required secrets at startup
     if (!env.ANTHROPIC_API_KEY) {
       return new Response('ANTHROPIC_API_KEY secret not set. Run: wrangler secret put ANTHROPIC_API_KEY', {

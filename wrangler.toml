@@ -3,12 +3,20 @@ main = "src/worker.js"
 compatibility_date = "2025-05-14"
 compatibility_flags = ["nodejs_compat"]
 
+# Keep the *.workers.dev URL live (the /publicist skill posts to publicist.robertlbutt.workers.dev)
+workers_dev = true
+
+# Custom domain — provisions DNS + hostname for publicist.engageengine.ai
+[[routes]]
+pattern = "publicist.engageengine.ai"
+custom_domain = true
+
 # Create D1 database: wrangler d1 create publicist
 # Then paste the database_id below
 [[d1_databases]]
 binding = "DB"
 database_name = "publicist"
-database_id = "REPLACE_WITH_D1_DATABASE_ID"
+database_id = "7689cd66-b28f-46e9-abf4-8ca347542a53"
 
 # Create queue: wrangler queues create publicist-pipeline
 [[queues.producers]]
