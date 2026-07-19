@@ -17,7 +17,8 @@ CREATE TABLE IF NOT EXISTS journalists (
   publication TEXT,
   beat_keywords TEXT, -- JSON array of strings
   last_contacted_at INTEGER, -- Unix ms; updated at send time (not approval)
-  response_rate REAL DEFAULT 0
+  response_rate REAL DEFAULT 0,
+  outlet_type TEXT DEFAULT 'journalist' -- journalist | blog | podcast
 );
 
 CREATE TABLE IF NOT EXISTS briefs (

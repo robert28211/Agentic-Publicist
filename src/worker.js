@@ -160,9 +160,25 @@ Return a JSON array of exactly 3 story angles:
 
 // Call 3 — Pitch Drafting (per journalist)
 async function draftPitch(journalist, entity, angle, briefBody, articleTitle, articleSnippet, env) {
-  const system = `${PUBLICIST_PERSONA}
+  const outletType = journalist.outlet_type || 'journalist';
+  const isGuestPitch = outletType === 'podcast' || outletType === 'blog';
 
-Your current task: draft ONE media pitch on behalf of ${entity.name} to a specific journalist.
+  const taskRules = isGuestPitch
+    ? `Your current task: draft ONE guest-booking pitch on behalf of ${entity.name} to the host of a ${outletType}. You are pitching a PERSON as a guest (or contributor), not a press story.
+Entity bio: ${entity.bio_long}
+Expertise: ${entity.expertise_keywords}
+
+Rules:
+- Open with why their AUDIENCE wins — the specific insight or story the guest brings, not the guest's résumé
+- Propose 2-3 concrete talking points drawn from the brief (real numbers and stakes, not themes)
+- Reference their recent episode/post (provided below) and why this fits their show specifically
+- Make the ask explicit and low-friction (a 30-45 min recording, flexible scheduling)
+- 150 words max for body
+- Subject line 7 words max, no clickbait, no ALL CAPS
+- Never fabricate quotes or statistics not in the brief
+- Write in first person as if from ${entity.name}
+- Return valid JSON only`
+    : `Your current task: draft ONE media pitch on behalf of ${entity.name} to a specific journalist.
 Entity bio: ${entity.bio_long}
 Expertise: ${entity.expertise_keywords}
 
@@ -175,8 +191,12 @@ Rules:
 - Write in first person as if from ${entity.name}
 - Return valid JSON only`;
 
-  const user = `Journalist: ${journalist.name}, ${journalist.publication}
-Their recent article: "${articleTitle}" — ${articleSnippet || 'recent coverage'}
+  const system = `${PUBLICIST_PERSONA}
+
+${taskRules}`;
+
+  const user = `${isGuestPitch ? 'Host' : 'Journalist'}: ${journalist.name}, ${journalist.publication}
+Their recent ${isGuestPitch ? 'episode/post' : 'article'}: "${articleTitle}" — ${articleSnippet || 'recent coverage'}
 
 Brief: ${briefBody}
 Story angle for this journalist: ${angle.angle}
@@ -340,7 +360,15 @@ async function processBrief(message, env) {
     steps[0].done = true; steps[0].ts = now();
     await updateProgress(steps);
 
-    const headlines = await getTopHeadlines('marketing technology AI automation');
+    // Why-now context: derive the news query from the ENTITY, not a hardcoded
+    // marketing-tech string — a nonprofit client needs arts/community headlines,
+    // not AI-automation headlines.
+    let newsQuery = 'marketing technology AI automation';
+    try {
+      const kw = JSON.parse(entity.expertise_keywords || '[]');
+      if (kw.length) newsQuery = kw.slice(0, 3).join(' ');
+    } catch { /* fall back to default */ }
+    const headlines = await getTopHeadlines(newsQuery);
 
     // Step 2: Generate angles (Call 1 — cached system prompt)
     steps[1].done = true; steps[1].ts = now();
@@ -556,8 +584,12 @@ ${body}
 async function briefPage(req, env) {
   const db = env.DB;
   const url = new URL(req.url);
-  const selectedEntity = url.searchParams.get('entity') || 'engageengine';
   const msg = url.searchParams.get('msg');
+
+  // Entities come from D1 — /api/import can create client entities, so the
+  // dropdown must not be hardcoded to the three seeded ones.
+  const entities = await db.prepare('SELECT id, name FROM entities ORDER BY name').all().then(r => r.results || []);
+  const selectedEntity = url.searchParams.get('entity') || (entities.find(e => e.id === 'engageengine') ? 'engageengine' : (entities[0] || {}).id || '');
 
   // Get last brief for status line
   const lastBrief = await db.prepare(
@@ -572,32 +604,81 @@ async function briefPage(req, env) {
     ? '<div class="alert alert-success">Brief queued — pitches will be ready in ~45 seconds.</div>'
     : '';
 
+  const entityOptions = entities.map(e =>
+    `<option value="${esc(e.id)}" ${e.id === selectedEntity ? 'selected' : ''}>${esc(e.name)}</option>`
+  ).join('');
+
   const body = `
 <div class="page">
   ${msgHtml}
   <div style="margin-bottom:28px">
     <div class="label" style="margin-bottom:10px">Entity</div>
-    <select id="entitySelect" onchange="window.location='/brief?entity='+this.value">
-      <option value="engageengine" ${selectedEntity === 'engageengine' ? 'selected' : ''}>EngageEngine</option>
-      <option value="robbie" ${selectedEntity === 'robbie' ? 'selected' : ''}>Robbie Butt</option>
-      <option value="marketingperformance" ${selectedEntity === 'marketingperformance' ? 'selected' : ''}>Marketing Performance</option>
+    <select id="entitySelect" onchange="window.location='/brief?entity='+encodeURIComponent(this.value)">
+      ${entityOptions}
     </select>
     <div class="status-line" style="margin-top:8px">${lastRun}</div>
   </div>
 
   <form method="POST" action="/api/generate" id="briefForm">
-    <input type="hidden" name="entity_id" value="${selectedEntity}">
+    <input type="hidden" name="entity_id" value="${esc(selectedEntity)}">
     <div class="form-group">
       <textarea name="body" id="briefBody" placeholder="Paste your announcement brief — what happened, why it matters, who should care" required></textarea>
     </div>
-    <div style="display:flex;align-items:center;gap:16px">
+    <div id="interviewBox" style="display:none;margin-bottom:20px">
+      <div class="label" style="margin-bottom:10px">Strategic Interview — answer what you can, skip what you can't</div>
+      <div id="interviewQs"></div>
+    </div>
+    <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
       <button type="submit" class="btn btn-primary" id="submitBtn">Generate Pitches</button>
+      <button type="button" class="btn btn-ghost" id="interviewBtn">Interview Me First</button>
       <span class="muted">~45 seconds</span>
     </div>
   </form>
 </div>
 <script>
+var interviewDone = false;
+document.getElementById('interviewBtn').addEventListener('click', function() {
+  var btn = this;
+  var body = document.getElementById('briefBody').value.trim();
+  if (!body) { alert('Paste your announcement first — the interview digs into it.'); return; }
+  btn.disabled = true; btn.textContent = 'Thinking…';
+  fetch('/api/interview', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ entity_id: document.querySelector('input[name=entity_id]').value, body: body })
+  }).then(function(r) { return r.json(); }).then(function(d) {
+    if (!d.ok || !d.questions || !d.questions.length) { btn.textContent = 'Interview unavailable'; return; }
+    var box = document.getElementById('interviewQs');
+    box.innerHTML = '';
+    d.questions.forEach(function(q, i) {
+      var wrap = document.createElement('div');
+      wrap.className = 'form-group';
+      var lab = document.createElement('label');
+      lab.textContent = q;
+      var ta = document.createElement('textarea');
+      ta.style.minHeight = '60px';
+      ta.setAttribute('data-iq', q);
+      wrap.appendChild(lab); wrap.appendChild(ta); box.appendChild(wrap);
+    });
+    document.getElementById('interviewBox').style.display = 'block';
+    btn.style.display = 'none';
+    interviewDone = true;
+    document.getElementById('submitBtn').textContent = 'Generate from Interview';
+  }).catch(function() { btn.disabled = false; btn.textContent = 'Interview Me First'; });
+});
 document.getElementById('briefForm').addEventListener('submit', function() {
+  if (interviewDone) {
+    var extra = '';
+    var tas = document.querySelectorAll('#interviewQs textarea');
+    for (var i = 0; i < tas.length; i++) {
+      var a = tas[i].value.trim();
+      if (a) extra += '\\nQ: ' + tas[i].getAttribute('data-iq') + '\\nA: ' + a;
+    }
+    if (extra) {
+      var bb = document.getElementById('briefBody');
+      bb.value = bb.value + '\\n\\n--- STRATEGIC INTERVIEW ---' + extra;
+    }
+  }
   document.getElementById('submitBtn').disabled = true;
   document.getElementById('submitBtn').textContent = 'Queuing…';
 });
@@ -886,9 +967,10 @@ async function journalistsPage(req, env) {
   const rows = journalists.length ? journalists.map(j => {
     const beats = JSON.parse(j.beat_keywords || '[]');
     const lastContact = j.last_contacted_at ? relativeTime(j.last_contacted_at) : 'Never';
+    const ot = j.outlet_type || 'journalist';
     return `
 <tr>
-  <td style="font-weight:600">${esc(j.name)}</td>
+  <td style="font-weight:600">${esc(j.name)}${ot !== 'journalist' ? ` <span class="pitch-angle" style="margin-left:6px">${esc(ot)}</span>` : ''}</td>
   <td>${esc(j.publication)}</td>
   <td>${esc(j.email)}</td>
   <td>${beats.map(b => `<span class="pitch-angle" style="margin-right:4px">${esc(b)}</span>`).join('')}</td>
@@ -933,6 +1015,15 @@ async function journalistsPage(req, env) {
         <select name="beats" multiple size="3"
           style="width:100%;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:13px;padding:6px 10px;outline:none">
           ${beatOptions}
+        </select>
+      </div>
+      <div class="form-group" style="margin:0">
+        <label>Outlet type</label>
+        <select name="outlet_type"
+          style="width:100%;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:13px;padding:9px 12px;outline:none">
+          <option value="journalist" selected>Journalist</option>
+          <option value="blog">Blog</option>
+          <option value="podcast">Podcast</option>
         </select>
       </div>
       <div style="grid-column:1/-1">
@@ -1064,14 +1155,15 @@ async function handleAddJournalist(req, env) {
   const email = (form.get('email') || '').trim().toLowerCase();
   const publication = (form.get('publication') || '').trim();
   const beats = form.getAll('beats').filter(b => KNOWN_BEATS.includes(b));
+  const outletType = ['journalist', 'blog', 'podcast'].includes(form.get('outlet_type')) ? form.get('outlet_type') : 'journalist';
 
   if (!name || !email || !publication) {
     return redirect(req, '/journalists?msg=error', 303);
   }
 
   await env.DB.prepare(
-    'INSERT OR IGNORE INTO journalists (id, name, email, publication, beat_keywords, last_contacted_at) VALUES (?,?,?,?,?,?)'
-  ).bind(uid(), name, email, publication, JSON.stringify(beats), null).run();
+    'INSERT OR IGNORE INTO journalists (id, name, email, publication, beat_keywords, last_contacted_at, outlet_type) VALUES (?,?,?,?,?,?,?)'
+  ).bind(uid(), name, email, publication, JSON.stringify(beats), null, outletType).run();
 
   return redirect(req, '/journalists?msg=added', 303);
 }
@@ -1298,10 +1390,11 @@ async function handleImportPlan(req, env) {
     } else {
       journalistId = uid();
       await db.prepare(
-        'INSERT INTO journalists (id, name, email, publication, beat_keywords) VALUES (?,?,?,?,?)'
+        'INSERT INTO journalists (id, name, email, publication, beat_keywords, outlet_type) VALUES (?,?,?,?,?,?)'
       ).bind(
         journalistId, jr.name, jr.email || null, jr.publication || null,
-        jr.beat_keywords ? JSON.stringify(jr.beat_keywords) : null
+        jr.beat_keywords ? JSON.stringify(jr.beat_keywords) : null,
+        ['journalist', 'blog', 'podcast'].includes(jr.outlet_type) ? jr.outlet_type : 'journalist'
       ).run();
     }
     await db.prepare(
@@ -1329,16 +1422,67 @@ async function handleRoster(req, env) {
   if (!env.INGEST_TOKEN || token !== env.INGEST_TOKEN) {
     return json({ error: 'Unauthorized' }, 401);
   }
-  const rows = await env.DB.prepare(
-    'SELECT name, email, publication, beat_keywords FROM journalists ORDER BY publication, name'
-  ).all().then(r => r.results || []);
+  const typeFilter = new URL(req.url).searchParams.get('type'); // journalist | blog | podcast
+  const rows = typeFilter
+    ? await env.DB.prepare(
+        "SELECT name, email, publication, beat_keywords, outlet_type FROM journalists WHERE coalesce(outlet_type,'journalist')=? ORDER BY publication, name"
+      ).bind(typeFilter).all().then(r => r.results || [])
+    : await env.DB.prepare(
+        'SELECT name, email, publication, beat_keywords, outlet_type FROM journalists ORDER BY publication, name'
+      ).all().then(r => r.results || []);
   const journalists = rows.map(j => ({
     name: j.name,
     email: j.email || null,
     publication: j.publication,
+    outlet_type: j.outlet_type || 'journalist',
     beats: (() => { try { return JSON.parse(j.beat_keywords || '[]'); } catch { return []; } })(),
   }));
   return json({ ok: true, count: journalists.length, journalists });
+}
+
+// ============================================================
+// Interview-first brief capture (borrowed from Pressmaster's
+// interview-first pattern, run through OUR persona). Given a raw
+// announcement, returns 4-5 strategic-interrogation questions that
+// dig for the protagonist, the proof point, the why-now, and the
+// stakes — the exact probing that surfaced Cooper Rust and the
+// $1,500→300-kids proof in the A4A run. Answers get folded into
+// the brief body before /api/generate.
+// Session-gated (called by the logged-in /brief page).
+// ============================================================
+async function handleInterview(req, env) {
+  let payload;
+  try { payload = await req.json(); }
+  catch { return json({ error: 'Invalid JSON body' }, 400); }
+  const briefBody = (payload.body || '').trim();
+  if (!briefBody) return json({ error: 'body is required' }, 400);
+
+  const entity = payload.entity_id
+    ? await env.DB.prepare('SELECT * FROM entities WHERE id=?').bind(payload.entity_id).first()
+    : null;
+
+  const system = `${PUBLICIST_PERSONA}
+
+Your current task: strategic interrogation. A raw announcement follows. Do NOT write angles or pitches. Instead, ask the 4-5 questions whose answers would most upgrade this story — hunting specifically for:
+- the human PROTAGONIST (who is this really about?)
+- the concrete PROOF POINT (a real number, stake, or outcome)
+- the WHY-NOW / timing hook
+- the tension, risk, or blind spot in the current framing
+Each question must be specific to THIS announcement, not generic PR intake. If the announcement already answers something, don't ask it.
+Return ONLY a raw JSON array of question strings — no markdown fences, no preamble.`;
+
+  const user = `${entity ? `Entity: ${entity.name} (${entity.type}). Bio: ${entity.bio_short || entity.bio_long || ''}\n` : ''}Announcement:
+${briefBody}
+
+Return: ["question 1", "question 2", ...]`;
+
+  const text = await callClaude([{ role: 'user', content: user }], system, env, { cacheSystem: true, maxTokens: 800 });
+  const match = text.match(/\[[\s\S]*\]/);
+  if (!match) return json({ error: 'Could not generate questions' }, 502);
+  let questions;
+  try { questions = JSON.parse(match[0]).filter(q => typeof q === 'string').slice(0, 5); }
+  catch { return json({ error: 'Could not parse questions' }, 502); }
+  return json({ ok: true, questions });
 }
 
 // ============================================================
@@ -1375,6 +1519,7 @@ export default {
     if (path === '/api/generate' && method === 'POST') return handleGenerate(req, env);
     if (path === '/api/import' && method === 'POST') return handleImportPlan(req, env);
     if (path === '/api/roster' && method === 'GET') return handleRoster(req, env);
+    if (path === '/api/interview' && method === 'POST') return handleInterview(req, env);
 
     const briefStatusMatch = path.match(/^\/api\/briefs\/([^/]+)\/status$/);
     if (briefStatusMatch) return handleBriefStatus(briefStatusMatch[1], env);
