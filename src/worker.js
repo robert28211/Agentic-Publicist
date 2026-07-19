@@ -74,8 +74,12 @@ export async function getJournalistsForBeat(beat, db) {
 
 async function callClaude(messages, systemText, env, { cacheSystem = false, maxTokens = 1024 } = {}) {
   const body = {
-    model: 'claude-sonnet-4-6',
+    model: 'claude-sonnet-5',
     max_tokens: maxTokens,
+    // Sonnet 5 defaults to extended thinking, which returns a thinking block as
+    // content[0] (no .text) and can yield empty/instructional output. Disable it
+    // so content[0].text is the answer. (Same fix used in command-center + CRM.)
+    thinking: { type: 'disabled' },
     messages,
   };
 
@@ -102,21 +106,38 @@ async function callClaude(messages, systemText, env, { cacheSystem = false, maxT
   }
 
   const data = await res.json();
-  return data.content[0].text;
+  const textBlock = (data.content || []).find(b => b.type === 'text') || data.content[0];
+  return textBlock ? textBlock.text : '';
 }
+
+// Shared elite-publicist persona — mirrors ~/.claude/skills/publicist/SKILL.md so the
+// worker pipeline reasons at the same level as the in-session /publicist skill.
+// Kept as the stable system-prompt PREFIX (prompt-cached) with a per-call task appended.
+const PUBLICIST_PERSONA = `You are an elite, world-class publicist and narrative strategist operating at the level of top-tier Hollywood PR firms, political communications war rooms, and high-growth startup launch teams. Your job is not to generate publicity ideas — it is to engineer public perception, attention momentum, credibility transfer, and cultural relevance.
+
+How you think:
+- Attention is warfare. Safe messaging is ignored; generic positioning dies unseen. Seek tension, contrast, unexpected framing, emotionally loaded hooks, curiosity gaps, and status dynamics.
+- Narrative over information. Facts don't spread — stories do. Convert ordinary announcements into narratives people emotionally attach to. Frame the subject as category leader, challenger, protector, rebel, innovator, truth-teller, or movement-builder — whichever creates the most asymmetric attention.
+- Think like a journalist. Before anything, ask: Why would anyone care? Why now? What makes this different? What emotional reaction does it trigger? Is this truly newsworthy or just self-promotion? What headline would a journalist actually publish?
+- Find the protagonist and the proof. The strongest local stories have a human protagonist and a concrete, specific proof point (a real number, a real stake, a real outcome). Lead with those, never with the organization.
+- Never sound corporate. No bloated PR language, fake enthusiasm, buzzwords, empty "mission" talk, or sanitized messaging. Write with clarity, precision, emotional intelligence, and strategic sharpness.
+- Never fabricate. Do not invent quotes, statistics, names, or facts not present in the brief. If a detail would strengthen the story but isn't given, note the gap — don't manufacture it.`;
 
 // Call 1 — Angle Generation
 async function generateAngles(briefBody, entity, headlines, env) {
-  const system = `You are the publicist agent for ${entity.name}.
+  const system = `${PUBLICIST_PERSONA}
+
+Your current task: generate story angles for ${entity.name}.
 Type: ${entity.type}
 Expertise: ${entity.expertise_keywords}
 Bio: ${entity.bio_long}
 
 Rules:
 - Generate story angles only, no pitches yet
-- Each angle must be genuinely newsworthy, not promotional
+- Each angle must be genuinely newsworthy, not promotional — carry a real tension, protagonist, or proof point
+- Keep each "angle" to 1-2 tight sentences — punchy, not a paragraph
 - Reference current news context where relevant
-- Return valid JSON only`;
+- Return ONLY the raw JSON array — no markdown fences, no preamble`;
 
   const user = `Brief: ${briefBody}
 Today's date: ${new Date().toISOString().split('T')[0]}
@@ -129,7 +150,7 @@ Return a JSON array of exactly 3 story angles:
     [{ role: 'user', content: user }],
     system,
     env,
-    { cacheSystem: true, maxTokens: 512 }
+    { cacheSystem: true, maxTokens: 2000 }
   );
 
   const match = text.match(/\[[\s\S]*\]/);
@@ -139,17 +160,19 @@ Return a JSON array of exactly 3 story angles:
 
 // Call 3 — Pitch Drafting (per journalist)
 async function draftPitch(journalist, entity, angle, briefBody, articleTitle, articleSnippet, env) {
-  const system = `You are drafting a media pitch on behalf of ${entity.name}.
+  const system = `${PUBLICIST_PERSONA}
+
+Your current task: draft ONE media pitch on behalf of ${entity.name} to a specific journalist.
 Entity bio: ${entity.bio_long}
 Expertise: ${entity.expertise_keywords}
 
 Rules:
-- Reference a specific article the journalist wrote (provided below)
+- Open with the story hook / protagonist, not the announcement
+- Reference a specific article the journalist wrote (provided below) and why THIS journalist at THIS publication is the right fit
 - 150 words max for body
 - Subject line 7 words max, no clickbait, no ALL CAPS
 - Never fabricate quotes or statistics not in the brief
 - Write in first person as if from ${entity.name}
-- Be specific about why THIS journalist at THIS publication
 - Return valid JSON only`;
 
   const user = `Journalist: ${journalist.name}, ${journalist.publication}
@@ -165,7 +188,7 @@ Return JSON: {"subject": "string", "body": "string"}`;
     [{ role: 'user', content: user }],
     system,
     env,
-    { cacheSystem: true, maxTokens: 512 }
+    { cacheSystem: true, maxTokens: 1200 }
   );
 
   const match = text.match(/\{[\s\S]*\}/);
@@ -390,7 +413,8 @@ async function processBrief(message, env) {
     );
 
   } catch (err) {
-    await db.prepare("UPDATE briefs SET status='error' WHERE id=?").bind(briefId).run();
+    await db.prepare("UPDATE briefs SET status='error', progress_log=? WHERE id=?")
+      .bind(JSON.stringify([{ step: 'ERROR', msg: String((err && err.message) || err), done: false, ts: now() }]), briefId).run();
     // Do NOT ack — let Cloudflare retry up to max_retries
     throw err;
   }
@@ -402,18 +426,18 @@ async function processBrief(message, env) {
 
 const CSS = `
 :root {
-  --bg: #0a0a0f;
-  --surface: #13131a;
-  --border: #1e1e2e;
-  --text: #e8e8f0;
-  --dim: #8888a8;
-  --accent: #4f8cff;
-  --green: #22c55e;
-  --amber: #f59e0b;
-  --red: #ef4444;
+  --bg: #F5F3EE;
+  --surface: #FFFFFF;
+  --border: #E2DED5;
+  --text: #1C1917;
+  --dim: #78716C;
+  --accent: #CF6344;
+  --green: #16A34A;
+  --amber: #D97706;
+  --red: #DC2626;
 }
 * { box-sizing: border-box; margin: 0; padding: 0; }
-body { background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; font-size: 15px; line-height: 1.5; }
+body { background: var(--bg); color: var(--text); font-family: 'DM Sans', -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; font-size: 15px; line-height: 1.5; }
 a { color: var(--accent); text-decoration: none; }
 a:hover { text-decoration: underline; }
 .nav { display: flex; align-items: center; gap: 0; border-bottom: 1px solid var(--border); background: var(--surface); padding: 0 24px; }
@@ -473,7 +497,7 @@ select:focus { border-color: var(--accent); }
 .coverage-item:last-child { border-bottom: none; }
 .sentiment-badge { display: inline-flex; align-items: center; gap: 4px; border-radius: 12px; padding: 3px 10px; font-size: 12px; font-weight: 600; }
 .sentiment-badge.positive { background: rgba(34,197,94,.15); color: var(--green); }
-.sentiment-badge.neutral { background: rgba(136,136,168,.15); color: var(--dim); }
+.sentiment-badge.neutral { background: rgba(120,113,108,.14); color: var(--dim); }
 .sentiment-badge.negative { background: rgba(239,68,68,.15); color: var(--red); }
 .empty-state { text-align: center; padding: 60px 20px; color: var(--dim); }
 .empty-state h3 { font-size: 16px; color: var(--text); margin-bottom: 8px; }
@@ -510,6 +534,9 @@ function shell(title, body, activeTab, queueCount = 0) {
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>${title} — Agentic Publicist</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>${CSS}</style>
 </head>
 <body>
@@ -1201,12 +1228,126 @@ async function eeGate(request, env, publicRes) {
 }
 
 // ============================================================
+// Skill ingest — persist a fully-formed plan produced by the
+// /publicist skill so it lands in D1 and shows in /queue.
+// Unlike /api/generate (which re-runs the worker pipeline), this
+// stores the skill's OWN plan verbatim and supports any client
+// entity, not just the three seeded ones.
+// Auth: Authorization: Bearer <INGEST_TOKEN>
+// ============================================================
+async function handleImportPlan(req, env) {
+  const auth = req.headers.get('Authorization') || '';
+  const token = auth.replace(/^Bearer\s+/i, '').trim();
+  if (!env.INGEST_TOKEN || token !== env.INGEST_TOKEN) {
+    return json({ error: 'Unauthorized' }, 401);
+  }
+
+  let payload;
+  try { payload = await req.json(); }
+  catch { return json({ error: 'Invalid JSON body' }, 400); }
+
+  const ent = payload.entity || {};
+  const brief = payload.brief || {};
+  const pitches = Array.isArray(payload.pitches) ? payload.pitches : [];
+
+  if (!ent.name || !brief.body) {
+    return json({ error: 'entity.name and brief.body are required' }, 400);
+  }
+
+  const db = env.DB;
+
+  // 1) Upsert entity — by explicit id, else by name (case-insensitive).
+  let entityRow = null;
+  if (ent.id) entityRow = await db.prepare('SELECT id FROM entities WHERE id=?').bind(ent.id).first();
+  if (!entityRow) entityRow = await db.prepare('SELECT id FROM entities WHERE lower(name)=lower(?)').bind(ent.name).first();
+  let entityId;
+  if (entityRow) {
+    entityId = entityRow.id;
+  } else {
+    entityId = ent.id || uid();
+    await db.prepare(
+      'INSERT INTO entities (id, name, type, bio_short, bio_long, expertise_keywords) VALUES (?,?,?,?,?,?)'
+    ).bind(
+      entityId, ent.name, ent.type || 'client',
+      ent.bio_short || null, ent.bio_long || null,
+      ent.expertise_keywords ? JSON.stringify(ent.expertise_keywords) : null
+    ).run();
+  }
+
+  // 2) Insert the brief — already complete; the skill produced the plan.
+  const briefId = uid();
+  const angles = brief.angles ? JSON.stringify(brief.angles) : null;
+  const progressLog = JSON.stringify([{ step: 'Imported from /publicist skill', done: true, ts: now() }]);
+  await db.prepare(
+    'INSERT INTO briefs (id, entity_id, body, angles, status, progress_log, created_at) VALUES (?,?,?,?,?,?,?)'
+  ).bind(briefId, entityId, brief.body, angles, 'complete', progressLog, now()).run();
+
+  // 3) Upsert journalists + insert pitches so they render in /queue.
+  let pitchCount = 0;
+  for (const p of pitches) {
+    const jr = p.journalist || {};
+    if (!jr.name) continue;
+    let jrow = null;
+    if (jr.email) jrow = await db.prepare('SELECT id FROM journalists WHERE lower(email)=lower(?)').bind(jr.email).first();
+    if (!jrow) jrow = await db.prepare(
+      "SELECT id FROM journalists WHERE lower(name)=lower(?) AND lower(coalesce(publication,''))=lower(?)"
+    ).bind(jr.name, jr.publication || '').first();
+    let journalistId;
+    if (jrow) {
+      journalistId = jrow.id;
+    } else {
+      journalistId = uid();
+      await db.prepare(
+        'INSERT INTO journalists (id, name, email, publication, beat_keywords) VALUES (?,?,?,?,?)'
+      ).bind(
+        journalistId, jr.name, jr.email || null, jr.publication || null,
+        jr.beat_keywords ? JSON.stringify(jr.beat_keywords) : null
+      ).run();
+    }
+    await db.prepare(
+      'INSERT INTO pitches (id, entity_id, journalist_id, brief_id, story_angle, subject, body, status, created_at) VALUES (?,?,?,?,?,?,?,?,?)'
+    ).bind(
+      uid(), entityId, journalistId, briefId,
+      p.story_angle || null, p.subject || null, p.body || null, 'pending', now()
+    ).run();
+    pitchCount++;
+  }
+
+  const origin = new URL(req.url).origin;
+  return json({ ok: true, entityId, briefId, pitchCount, queueUrl: `${origin}/queue` });
+}
+
+// ============================================================
+// Roster read — lets the /publicist skill pull the real journalist
+// DB before writing pitches, so it targets actual named reporters
+// (like the A4A run) instead of inventing them.
+// Auth: Authorization: Bearer <INGEST_TOKEN>
+// ============================================================
+async function handleRoster(req, env) {
+  const auth = req.headers.get('Authorization') || '';
+  const token = auth.replace(/^Bearer\s+/i, '').trim();
+  if (!env.INGEST_TOKEN || token !== env.INGEST_TOKEN) {
+    return json({ error: 'Unauthorized' }, 401);
+  }
+  const rows = await env.DB.prepare(
+    'SELECT name, email, publication, beat_keywords FROM journalists ORDER BY publication, name'
+  ).all().then(r => r.results || []);
+  const journalists = rows.map(j => ({
+    name: j.name,
+    email: j.email || null,
+    publication: j.publication,
+    beats: (() => { try { return JSON.parse(j.beat_keywords || '[]'); } catch { return []; } })(),
+  }));
+  return json({ ok: true, count: journalists.length, journalists });
+}
+
+// ============================================================
 // MAIN EXPORT
 // ============================================================
 
 export default {
   async fetch(req, env) {
-    const eeBlocked = await eeGate(req, env, [/^\/api\/webhook\/resend$/, /^\/api\/health$/]);
+    const eeBlocked = await eeGate(req, env, [/^\/api\/webhook\/resend$/, /^\/api\/health$/, /^\/api\/import$/, /^\/api\/roster$/]);
     if (eeBlocked) return eeBlocked;
 
     // Validate required secrets at startup
@@ -1232,6 +1373,8 @@ export default {
 
     // API
     if (path === '/api/generate' && method === 'POST') return handleGenerate(req, env);
+    if (path === '/api/import' && method === 'POST') return handleImportPlan(req, env);
+    if (path === '/api/roster' && method === 'GET') return handleRoster(req, env);
 
     const briefStatusMatch = path.match(/^\/api\/briefs\/([^/]+)\/status$/);
     if (briefStatusMatch) return handleBriefStatus(briefStatusMatch[1], env);
