@@ -18,7 +18,19 @@ CREATE TABLE IF NOT EXISTS journalists (
   beat_keywords TEXT, -- JSON array of strings
   last_contacted_at INTEGER, -- Unix ms; updated at send time (not approval)
   response_rate REAL DEFAULT 0,
-  outlet_type TEXT DEFAULT 'journalist' -- journalist | blog | podcast
+  outlet_type TEXT DEFAULT 'journalist', -- journalist | blog | podcast
+  contact_url TEXT -- pitch/contact page when no email is published
+);
+
+CREATE TABLE IF NOT EXISTS discovery_runs (
+  id TEXT PRIMARY KEY,
+  query TEXT NOT NULL,
+  outlet_type TEXT DEFAULT 'podcast', -- journalist | blog | podcast
+  market TEXT,
+  status TEXT DEFAULT 'pending', -- pending | processing | complete | error
+  results TEXT, -- JSON array of candidates (with added:bool per candidate)
+  error TEXT,
+  created_at INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS briefs (

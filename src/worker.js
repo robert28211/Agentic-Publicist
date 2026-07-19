@@ -550,6 +550,7 @@ function shell(title, body, activeTab, queueCount = 0) {
     { href: '/queue', label: `Queue${queueCount ? `<span class="badge">${queueCount}</span>` : ''}`, key: 'queue' },
     { href: '/coverage', label: 'Coverage', key: 'coverage' },
     { href: '/journalists', label: 'Journalists', key: 'journalists' },
+    { href: '/discover', label: 'Discover', key: 'discover' },
   ];
 
   const navLinks = tabs.map(t =>
@@ -1486,12 +1487,323 @@ Return: ["question 1", "question 2", ...]`;
 }
 
 // ============================================================
+// Outlet discovery — search-grounded sourcing of real podcasts /
+// blogs / journalists for a topic + market, the way the 86 SC
+// journalists were sourced. Runs in the queue consumer (long wall
+// time), uses the Anthropic server-side web_search tool so every
+// candidate is grounded in a real page, and stages candidates for
+// human review before anything touches the roster.
+// ============================================================
+
+// Claude call with server-side web search + web fetch. MUST stream:
+// a non-streaming request with several searches exceeds the ~100s
+// HTTP edge timeout and dies with a 524. We accumulate SSE events
+// back into content blocks so the pause_turn resume loop still works,
+// then concatenate ALL text blocks (search responses interleave text
+// with web_search_tool_result blocks).
+async function streamClaudeOnce(body, env) {
+  const res = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-api-key': env.ANTHROPIC_API_KEY,
+      'anthropic-version': '2023-06-01',
+    },
+    body: JSON.stringify({ ...body, stream: true }),
+  });
+  if (!res.ok) {
+    const err = await res.text();
+    throw new Error(`Claude API ${res.status}: ${err.slice(0, 300)}`);
+  }
+  const content = [];
+  const inputBuf = {}; // index -> accumulated partial_json
+  let stopReason = null;
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = '';
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    const lines = buf.split('\n');
+    buf = lines.pop(); // keep incomplete tail
+    for (const line of lines) {
+      if (!line.startsWith('data: ')) continue;
+      let ev;
+      try { ev = JSON.parse(line.slice(6)); } catch { continue; }
+      if (ev.type === 'content_block_start') {
+        content[ev.index] = ev.content_block;
+        if (ev.content_block && ev.content_block.type === 'text') content[ev.index] = { ...ev.content_block, text: ev.content_block.text || '' };
+      } else if (ev.type === 'content_block_delta') {
+        const blk = content[ev.index];
+        if (!blk) continue;
+        if (ev.delta.type === 'text_delta') blk.text = (blk.text || '') + ev.delta.text;
+        else if (ev.delta.type === 'input_json_delta') inputBuf[ev.index] = (inputBuf[ev.index] || '') + ev.delta.partial_json;
+        else if (ev.delta.type === 'citations_delta') { /* ignore */ }
+      } else if (ev.type === 'content_block_stop') {
+        if (inputBuf[ev.index] !== undefined && content[ev.index]) {
+          try { content[ev.index].input = JSON.parse(inputBuf[ev.index] || '{}'); } catch { /* keep as-is */ }
+          delete inputBuf[ev.index];
+        }
+      } else if (ev.type === 'message_delta') {
+        if (ev.delta && ev.delta.stop_reason) stopReason = ev.delta.stop_reason;
+      }
+    }
+  }
+  return { content: content.filter(Boolean), stop_reason: stopReason };
+}
+
+async function callClaudeSearch(userPrompt, systemText, env, maxTokens = 4000) {
+  let messages = [{ role: 'user', content: userPrompt }];
+  const tools = [
+    { type: 'web_search_20260209', name: 'web_search', max_uses: 6 },
+    { type: 'web_fetch_20260209', name: 'web_fetch', max_uses: 4 },
+  ];
+  for (let turn = 0; turn < 6; turn++) {
+    const data = await streamClaudeOnce({
+      model: 'claude-sonnet-5',
+      max_tokens: maxTokens,
+      thinking: { type: 'disabled' },
+      system: systemText,
+      tools,
+      messages,
+    }, env);
+    if (data.stop_reason === 'pause_turn') {
+      // Server-side tool loop paused — append assistant turn and resume.
+      messages = [...messages, { role: 'assistant', content: data.content }];
+      continue;
+    }
+    return (data.content || []).filter(b => b.type === 'text').map(b => b.text).join('\n');
+  }
+  throw new Error('Search loop did not complete after 6 turns');
+}
+
+async function processDiscovery(message, env) {
+  const { discoveryId } = message.body;
+  const db = env.DB;
+  const run = await db.prepare('SELECT * FROM discovery_runs WHERE id=?').bind(discoveryId).first();
+  if (!run) { await message.ack(); return; }
+  if (run.status === 'complete') { await message.ack(); return; }
+  await db.prepare("UPDATE discovery_runs SET status='processing' WHERE id=?").bind(discoveryId).run();
+
+  const outletLabel = run.outlet_type === 'journalist' ? 'journalists / reporters'
+    : run.outlet_type === 'blog' ? 'blogs (with named authors/editors)'
+    : 'podcasts (with named hosts)';
+
+  const system = `${PUBLICIST_PERSONA}
+
+Your current task: media-outlet DISCOVERY, not pitching. Using web search, find REAL, currently-active ${outletLabel} relevant to the topic and market below. This roster will be used for actual outreach, so accuracy beats volume.
+
+Hard rules:
+- ONLY report outlets you actually verified exist via your search/fetch results. NEVER invent a show, blog, publication, host, or email. A wrong contact poisons the roster.
+- For each: find the host/author/reporter NAME, the outlet name, its URL, and the best CONTACT PATH (an email if one is published, else the contact/pitch page URL).
+- Prefer outlets that actively accept guests/pitches and have published recently (within ~6 months).
+- Assign 1-3 beats from exactly this list: marketing-tech, home-services, ai-automation, flooring-industry, small-business, digital-marketing, construction, sc-local, local-business.
+- 5-10 strong candidates beat 20 weak ones.
+- Return ONLY a raw JSON array, no markdown fences, in this shape:
+[{"name":"host or author name","publication":"outlet name","url":"https://...","email":"...or null","contact_url":"...or null","beats":["small-business"],"why_fit":"1-2 sentences: why this outlet fits the topic + evidence it's active"}]`;
+
+  const user = `Topic / who we're pitching: ${run.query}
+Market: ${run.market || 'United States (no specific city)'}
+Outlet type: ${run.outlet_type}`;
+
+  try {
+    const text = await callClaudeSearch(user, system, env, 4000);
+    const match = text.match(/\[[\s\S]*\]/);
+    if (!match) throw new Error('No JSON array in discovery output');
+    const candidates = JSON.parse(match[0])
+      .filter(c => c && c.name && c.publication)
+      .map(c => ({
+        name: String(c.name), publication: String(c.publication),
+        url: c.url || null, email: c.email || null, contact_url: c.contact_url || null,
+        beats: Array.isArray(c.beats) ? c.beats.filter(b => KNOWN_BEATS.includes(b)) : [],
+        why_fit: c.why_fit || '', added: false,
+      }));
+    await db.prepare("UPDATE discovery_runs SET status='complete', results=?, error=NULL WHERE id=?")
+      .bind(JSON.stringify(candidates), discoveryId).run();
+    await message.ack();
+    await telegram(`🔎 <b>Discovery complete</b>\n${candidates.length} ${run.outlet_type} candidates for "${run.query.slice(0, 60)}"\nReview at publicist.engageengine.ai/discover`, env);
+  } catch (err) {
+    await db.prepare("UPDATE discovery_runs SET status='error', error=? WHERE id=?")
+      .bind(String((err && err.message) || err).slice(0, 500), discoveryId).run();
+    throw err; // let CF retry
+  }
+}
+
+// Auth for discovery API: valid ee_session cookie (UI) OR Bearer INGEST_TOKEN (skill).
+async function discoveryAuthed(req, env) {
+  const auth = req.headers.get('Authorization') || '';
+  const token = auth.replace(/^Bearer\s+/i, '').trim();
+  if (env.INGEST_TOKEN && token === env.INGEST_TOKEN) return true;
+  return eeValid(env, eeCookie(req, 'ee_session'));
+}
+
+async function handleDiscover(req, env) {
+  if (!await discoveryAuthed(req, env)) return json({ error: 'Unauthorized' }, 401);
+  let payload;
+  try { payload = await req.json(); } catch { return json({ error: 'Invalid JSON body' }, 400); }
+  const query = (payload.query || '').trim();
+  if (!query) return json({ error: 'query is required' }, 400);
+  const outletType = ['journalist', 'blog', 'podcast'].includes(payload.outlet_type) ? payload.outlet_type : 'podcast';
+  const runId = uid();
+  await env.DB.prepare(
+    'INSERT INTO discovery_runs (id, query, outlet_type, market, status, created_at) VALUES (?,?,?,?,?,?)'
+  ).bind(runId, query, outletType, payload.market || null, 'pending', now()).run();
+  try {
+    await env.PIPELINE_QUEUE.send({ discoveryId: runId });
+  } catch {
+    await env.DB.prepare("UPDATE discovery_runs SET status='error', error='queue unavailable' WHERE id=?").bind(runId).run();
+    return json({ error: 'Service unavailable' }, 503);
+  }
+  return json({ ok: true, runId });
+}
+
+async function handleDiscoveryStatus(runId, req, env) {
+  if (!await discoveryAuthed(req, env)) return json({ error: 'Unauthorized' }, 401);
+  const run = await env.DB.prepare('SELECT * FROM discovery_runs WHERE id=?').bind(runId).first();
+  if (!run) return json({ error: 'Not found' }, 404);
+  return json({
+    ok: true, id: run.id, status: run.status, query: run.query,
+    outlet_type: run.outlet_type, market: run.market, error: run.error || null,
+    candidates: run.results ? JSON.parse(run.results) : [],
+  });
+}
+
+async function handleDiscoveryAdd(runId, req, env) {
+  if (!await discoveryAuthed(req, env)) return json({ error: 'Unauthorized' }, 401);
+  let payload;
+  try { payload = await req.json(); } catch { return json({ error: 'Invalid JSON body' }, 400); }
+  const idx = payload.index;
+  const run = await env.DB.prepare('SELECT * FROM discovery_runs WHERE id=?').bind(runId).first();
+  if (!run || !run.results) return json({ error: 'Not found' }, 404);
+  const candidates = JSON.parse(run.results);
+  const c = candidates[idx];
+  if (!c) return json({ error: 'Bad index' }, 400);
+
+  // Upsert into journalists (same matching as /api/import)
+  let row = null;
+  if (c.email) row = await env.DB.prepare('SELECT id FROM journalists WHERE lower(email)=lower(?)').bind(c.email).first();
+  if (!row) row = await env.DB.prepare(
+    "SELECT id FROM journalists WHERE lower(name)=lower(?) AND lower(coalesce(publication,''))=lower(?)"
+  ).bind(c.name, c.publication || '').first();
+  let journalistId;
+  if (row) {
+    journalistId = row.id;
+  } else {
+    journalistId = uid();
+    await env.DB.prepare(
+      'INSERT INTO journalists (id, name, email, publication, beat_keywords, outlet_type, contact_url) VALUES (?,?,?,?,?,?,?)'
+    ).bind(journalistId, c.name, c.email || null, c.publication, JSON.stringify(c.beats || []), run.outlet_type, c.contact_url || c.url || null).run();
+  }
+  c.added = true;
+  await env.DB.prepare('UPDATE discovery_runs SET results=? WHERE id=?').bind(JSON.stringify(candidates), runId).run();
+  return json({ ok: true, journalistId });
+}
+
+// ── /discover page ────────────────────────────────────────────
+async function discoverPage(req, env) {
+  const runs = await env.DB.prepare('SELECT * FROM discovery_runs ORDER BY created_at DESC LIMIT 10').all().then(r => r.results || []);
+  const runCards = runs.map(r => {
+    const cands = r.results ? JSON.parse(r.results) : [];
+    const cardsHtml = cands.map((c, i) => `
+<div class="pitch-card" style="${c.added ? 'opacity:.55' : ''}">
+  <div class="pitch-card-header">
+    <div class="pitch-card-meta">
+      <span class="pitch-journalist">${esc(c.name)}</span>
+      <span class="pitch-pub">${esc(c.publication)}</span>
+      ${(c.beats || []).map(b => `<span class="pitch-angle">${esc(b)}</span>`).join(' ')}
+    </div>
+    <div class="muted" style="margin-bottom:6px">
+      ${c.url ? `<a href="${esc(c.url)}" target="_blank" rel="noopener">${esc(c.url)}</a> · ` : ''}
+      ${c.email ? esc(c.email) : (c.contact_url ? `contact: <a href="${esc(c.contact_url)}" target="_blank" rel="noopener">${esc(c.contact_url)}</a>` : 'no contact found')}
+    </div>
+    <div class="pitch-body-preview" style="-webkit-line-clamp:3">${esc(c.why_fit || '')}</div>
+  </div>
+  <div class="pitch-actions">
+    ${c.added ? '<span style="color:var(--green);font-size:13px;font-weight:600">✓ In roster</span>'
+      : `<button class="btn btn-green btn-sm" onclick="addCandidate('${r.id}', ${i}, this)">Add to Roster</button>`}
+  </div>
+</div>`).join('');
+    return `
+<div class="card" style="margin-bottom:20px">
+  <div style="display:flex;justify-content:space-between;align-items:baseline;flex-wrap:wrap;gap:8px">
+    <h2 style="margin:0;font-size:15px">${esc(r.query)}</h2>
+    <span class="muted">${esc(r.outlet_type)}${r.market ? ' · ' + esc(r.market) : ''} · ${r.status === 'complete' ? cands.length + ' candidates' : esc(r.status)}</span>
+  </div>
+  ${r.status === 'error' ? `<div class="alert alert-error" style="margin-top:10px">${esc(r.error || 'failed')}</div>` : ''}
+  ${r.status === 'pending' || r.status === 'processing' ? '<div class="muted" style="margin-top:10px">Searching the web… refresh in ~1 minute.</div>' : ''}
+  <div style="margin-top:14px">${cardsHtml}</div>
+</div>`;
+  }).join('') || '<div class="empty-state"><h3>No discovery runs yet</h3><p>Search for podcasts, blogs, or journalists above.</p></div>';
+
+  const body = `
+<div class="page-wide">
+  <div class="card" style="margin-bottom:28px">
+    <h2 style="font-size:15px;margin-bottom:14px">Find Outlets</h2>
+    <form id="discoverForm" style="display:grid;grid-template-columns:2fr 1fr 1fr auto;gap:12px;align-items:end">
+      <div class="form-group" style="margin:0">
+        <label>Topic / who you're pitching</label>
+        <input type="text" id="dq" required placeholder="e.g. marketing podcasts that interview agency founders about local lead generation"
+          style="width:100%;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:14px;padding:9px 12px;outline:none">
+      </div>
+      <div class="form-group" style="margin:0">
+        <label>Outlet type</label>
+        <select id="dt" style="width:100%;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:13px;padding:9px 12px;outline:none">
+          <option value="podcast" selected>Podcasts</option>
+          <option value="blog">Blogs</option>
+          <option value="journalist">Journalists</option>
+        </select>
+      </div>
+      <div class="form-group" style="margin:0">
+        <label>Market (optional)</label>
+        <input type="text" id="dm" placeholder="e.g. Columbia SC, or national"
+          style="width:100%;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:14px;padding:9px 12px;outline:none">
+      </div>
+      <button type="submit" class="btn btn-primary" id="dbtn">Discover</button>
+    </form>
+    <div class="status-line" id="dstatus" style="margin-top:8px"></div>
+  </div>
+  ${runCards}
+</div>
+<script>
+document.getElementById('discoverForm').addEventListener('submit', function(e) {
+  e.preventDefault();
+  var btn = document.getElementById('dbtn');
+  btn.disabled = true; btn.textContent = 'Queuing…';
+  fetch('/api/discover', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ query: document.getElementById('dq').value, outlet_type: document.getElementById('dt').value, market: document.getElementById('dm').value })
+  }).then(function(r) { return r.json(); }).then(function(d) {
+    if (!d.ok) { document.getElementById('dstatus').textContent = d.error || 'failed'; btn.disabled = false; btn.textContent = 'Discover'; return; }
+    document.getElementById('dstatus').textContent = 'Searching the web — takes ~1-2 minutes. Page will refresh.';
+    var poll = setInterval(function() {
+      fetch('/api/discovery/' + d.runId).then(function(r) { return r.json(); }).then(function(s) {
+        if (s.status === 'complete' || s.status === 'error') { clearInterval(poll); window.location.reload(); }
+      });
+    }, 8000);
+  });
+});
+function addCandidate(runId, index, btn) {
+  btn.disabled = true; btn.textContent = 'Adding…';
+  fetch('/api/discovery/' + runId + '/add', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ index: index })
+  }).then(function(r) { return r.json(); }).then(function(d) {
+    if (d.ok) { btn.outerHTML = '<span style="color:var(--green);font-size:13px;font-weight:600">✓ In roster</span>'; }
+    else { btn.disabled = false; btn.textContent = 'Add to Roster'; }
+  });
+}
+</script>`;
+  return new Response(shell('Discover', body, 'discover'), { headers: { 'Content-Type': 'text/html;charset=UTF-8' } });
+}
+
+// ============================================================
 // MAIN EXPORT
 // ============================================================
 
 export default {
   async fetch(req, env) {
-    const eeBlocked = await eeGate(req, env, [/^\/api\/webhook\/resend$/, /^\/api\/health$/, /^\/api\/import$/, /^\/api\/roster$/]);
+    const eeBlocked = await eeGate(req, env, [/^\/api\/webhook\/resend$/, /^\/api\/health$/, /^\/api\/import$/, /^\/api\/roster$/, /^\/api\/discover$/, /^\/api\/discovery\//]);
     if (eeBlocked) return eeBlocked;
 
     // Validate required secrets at startup
@@ -1511,6 +1823,7 @@ export default {
     if (path === '/queue') return queuePage(req, env);
     if (path === '/coverage') return coveragePage(req, env);
     if (path === '/journalists') return journalistsPage(req, env);
+    if (path === '/discover') return discoverPage(req, env);
 
     const progressMatch = path.match(/^\/progress\/([^/]+)$/);
     if (progressMatch) return progressPage(progressMatch[1], env);
@@ -1519,6 +1832,11 @@ export default {
     if (path === '/api/generate' && method === 'POST') return handleGenerate(req, env);
     if (path === '/api/import' && method === 'POST') return handleImportPlan(req, env);
     if (path === '/api/roster' && method === 'GET') return handleRoster(req, env);
+    if (path === '/api/discover' && method === 'POST') return handleDiscover(req, env);
+    const discoveryStatusMatch = path.match(/^\/api\/discovery\/([^/]+)$/);
+    if (discoveryStatusMatch && method === 'GET') return handleDiscoveryStatus(discoveryStatusMatch[1], req, env);
+    const discoveryAddMatch = path.match(/^\/api\/discovery\/([^/]+)\/add$/);
+    if (discoveryAddMatch && method === 'POST') return handleDiscoveryAdd(discoveryAddMatch[1], req, env);
     if (path === '/api/interview' && method === 'POST') return handleInterview(req, env);
 
     const briefStatusMatch = path.match(/^\/api\/briefs\/([^/]+)\/status$/);
@@ -1542,7 +1860,11 @@ export default {
 
   async queue(batch, env) {
     for (const message of batch.messages) {
-      await processBrief(message, env);
+      if (message.body && message.body.discoveryId) {
+        await processDiscovery(message, env);
+      } else {
+        await processBrief(message, env);
+      }
     }
   },
 };
