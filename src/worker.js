@@ -6,6 +6,8 @@
 // via Hunter.io domain search). BEAT_KEYWORDS on each journalist row determines
 // which angles they're matched to. Add journalists via the /journalists page.
 
+import { PUBLICIST_PERSONA } from './persona.js';
+
 // ============================================================
 // CONSTANTS
 // ============================================================
@@ -110,18 +112,10 @@ async function callClaude(messages, systemText, env, { cacheSystem = false, maxT
   return textBlock ? textBlock.text : '';
 }
 
-// Shared elite-publicist persona — mirrors ~/.claude/skills/publicist/SKILL.md so the
-// worker pipeline reasons at the same level as the in-session /publicist skill.
-// Kept as the stable system-prompt PREFIX (prompt-cached) with a per-call task appended.
-const PUBLICIST_PERSONA = `You are an elite, world-class publicist and narrative strategist operating at the level of top-tier Hollywood PR firms, political communications war rooms, and high-growth startup launch teams. Your job is not to generate publicity ideas — it is to engineer public perception, attention momentum, credibility transfer, and cultural relevance.
-
-How you think:
-- Attention is warfare. Safe messaging is ignored; generic positioning dies unseen. Seek tension, contrast, unexpected framing, emotionally loaded hooks, curiosity gaps, and status dynamics.
-- Narrative over information. Facts don't spread — stories do. Convert ordinary announcements into narratives people emotionally attach to. Frame the subject as category leader, challenger, protector, rebel, innovator, truth-teller, or movement-builder — whichever creates the most asymmetric attention.
-- Think like a journalist. Before anything, ask: Why would anyone care? Why now? What makes this different? What emotional reaction does it trigger? Is this truly newsworthy or just self-promotion? What headline would a journalist actually publish?
-- Find the protagonist and the proof. The strongest local stories have a human protagonist and a concrete, specific proof point (a real number, a real stake, a real outcome). Lead with those, never with the organization.
-- Never sound corporate. No bloated PR language, fake enthusiasm, buzzwords, empty "mission" talk, or sanitized messaging. Write with clarity, precision, emotional intelligence, and strategic sharpness.
-- Never fabricate. Do not invent quotes, statistics, names, or facts not present in the brief. If a detail would strengthen the story but isn't given, note the gap — don't manufacture it.`;
+// Elite-publicist persona — single source of truth is src/persona.js
+// (a deliberate condensation of ~/.claude/skills/publicist/SKILL.md).
+// Imported, never inlined here, so the worker holds exactly one copy.
+// Used as the stable system-prompt PREFIX (prompt-cached) with a per-call task appended.
 
 // Call 1 — Angle Generation
 async function generateAngles(briefBody, entity, headlines, env) {
@@ -1803,7 +1797,7 @@ function addCandidate(runId, index, btn) {
 
 export default {
   async fetch(req, env) {
-    const eeBlocked = await eeGate(req, env, [/^\/api\/webhook\/resend$/, /^\/api\/health$/, /^\/api\/import$/, /^\/api\/roster$/, /^\/api\/discover$/, /^\/api\/discovery\//]);
+    const eeBlocked = await eeGate(req, env, [/^\/api\/webhook\/resend$/, /^\/api\/health$/, /^\/api\/import$/, /^\/api\/roster$/, /^\/api\/persona$/, /^\/api\/discover$/, /^\/api\/discovery\//]);
     if (eeBlocked) return eeBlocked;
 
     // Validate required secrets at startup
@@ -1832,6 +1826,7 @@ export default {
     if (path === '/api/generate' && method === 'POST') return handleGenerate(req, env);
     if (path === '/api/import' && method === 'POST') return handleImportPlan(req, env);
     if (path === '/api/roster' && method === 'GET') return handleRoster(req, env);
+    if (path === '/api/persona' && method === 'GET') return json({ ok: true, persona: PUBLICIST_PERSONA, canonical: 'src/persona.js (condensation of ~/.claude/skills/publicist/SKILL.md)' });
     if (path === '/api/discover' && method === 'POST') return handleDiscover(req, env);
     const discoveryStatusMatch = path.match(/^\/api\/discovery\/([^/]+)$/);
     if (discoveryStatusMatch && method === 'GET') return handleDiscoveryStatus(discoveryStatusMatch[1], req, env);
