@@ -1164,6 +1164,9 @@ async function handleAddJournalist(req, env) {
 }
 
 async function handleDeleteJournalist(journalistId, env) {
+  // Blocklist the contact as we remove it, so discovery never re-surfaces it.
+  const j = await env.DB.prepare('SELECT name, publication, email FROM journalists WHERE id=?').bind(journalistId).first();
+  if (j) await addRejected(env, j.name, j.publication, j.email, 'removed from roster');
   await env.DB.prepare('DELETE FROM journalists WHERE id=?').bind(journalistId).run();
   return json({ ok: true });
 }
@@ -1687,6 +1690,27 @@ async function handleDiscover(req, env) {
 // discovery_runs row for review on /discover — same shape the in-worker path
 // produced, so the review + add-to-roster UI is unchanged. This decouples the
 // slow multi-minute search from the Worker's request/queue time budget.
+// ── Blocklist: outlets the user marked "not a fit". They are filtered out of
+// every future ingest AND hidden in the /discover review, so a rejected show
+// never comes back no matter how many discovery runs surface it. ──
+async function loadRejected(env) {
+  const rows = await env.DB.prepare(
+    "SELECT lower(name) n, lower(coalesce(publication,'')) p, lower(coalesce(email,'')) e FROM rejected_outlets"
+  ).all().then(r => r.results || []);
+  const nameKeys = new Set(rows.map(r => r.n + '|' + r.p));
+  const emailKeys = new Set(rows.filter(r => r.e).map(r => r.e));
+  return { nameKeys, emailKeys };
+}
+function isRejected(rej, name, publication, email) {
+  if (email && rej.emailKeys.has(String(email).toLowerCase())) return true;
+  return rej.nameKeys.has(String(name || '').toLowerCase() + '|' + String(publication || '').toLowerCase());
+}
+async function addRejected(env, name, publication, email, reason) {
+  await env.DB.prepare(
+    'INSERT OR IGNORE INTO rejected_outlets (id, name, publication, email, reason, created_at) VALUES (?,?,?,?,?,?)'
+  ).bind(uid(), name || null, publication || null, email || null, reason || null, now()).run();
+}
+
 async function handleDiscoveryIngest(req, env) {
   if (!await discoveryAuthed(req, env)) return json({ error: 'Unauthorized' }, 401);
   let p;
@@ -1695,6 +1719,7 @@ async function handleDiscoveryIngest(req, env) {
   const outletType = ['journalist', 'blog', 'podcast'].includes(p.outlet_type) ? p.outlet_type : 'podcast';
   const raw = Array.isArray(p.candidates) ? p.candidates : [];
   if (!query || !raw.length) return json({ error: 'query and non-empty candidates[] are required' }, 400);
+  const rej = await loadRejected(env);
   const candidates = raw
     .filter(c => c && c.name && c.publication)
     .map(c => ({
@@ -1702,14 +1727,43 @@ async function handleDiscoveryIngest(req, env) {
       url: c.url || null, email: c.email || null, contact_url: c.contact_url || null,
       beats: Array.isArray(c.beats) ? c.beats.filter(b => KNOWN_BEATS.includes(b)) : [],
       why_fit: c.why_fit || '', added: false,
-    }));
-  if (!candidates.length) return json({ error: 'no valid candidates (each needs name + publication)' }, 400);
+    }))
+    .filter(c => !isRejected(rej, c.name, c.publication, c.email)); // drop blocklisted
+  if (!candidates.length) return json({ ok: true, runId: null, count: 0, note: 'all candidates were valid-empty or on the blocklist' });
   const runId = uid();
   await env.DB.prepare(
     'INSERT INTO discovery_runs (id, query, outlet_type, market, status, results, created_at) VALUES (?,?,?,?,?,?,?)'
   ).bind(runId, query, outletType, p.market || null, 'complete', JSON.stringify(candidates), now()).run();
   const origin = new URL(req.url).origin;
   return json({ ok: true, runId, count: candidates.length, reviewUrl: `${origin}/discover` });
+}
+
+// Reject a candidate: add to blocklist + mark it dismissed in the run.
+async function handleDiscoveryReject(runId, req, env) {
+  if (!await discoveryAuthed(req, env)) return json({ error: 'Unauthorized' }, 401);
+  let payload;
+  try { payload = await req.json(); } catch { return json({ error: 'Invalid JSON body' }, 400); }
+  const run = await env.DB.prepare('SELECT * FROM discovery_runs WHERE id=?').bind(runId).first();
+  if (!run || !run.results) return json({ error: 'Not found' }, 404);
+  const candidates = JSON.parse(run.results);
+  const c = candidates[payload.index];
+  if (!c) return json({ error: 'Bad index' }, 400);
+  await addRejected(env, c.name, c.publication, c.email, payload.reason || 'not a fit');
+  c.rejected = true; c.added = false;
+  await env.DB.prepare('UPDATE discovery_runs SET results=? WHERE id=?').bind(JSON.stringify(candidates), runId).run();
+  return json({ ok: true });
+}
+
+async function handleRejectedList(req, env) {
+  if (!await discoveryAuthed(req, env)) return json({ error: 'Unauthorized' }, 401);
+  const rows = await env.DB.prepare('SELECT id, name, publication, email, reason FROM rejected_outlets ORDER BY created_at DESC').all().then(r => r.results || []);
+  return json({ ok: true, count: rows.length, rejected: rows });
+}
+
+async function handleRejectedDelete(id, req, env) {
+  if (!await discoveryAuthed(req, env)) return json({ error: 'Unauthorized' }, 401);
+  await env.DB.prepare('DELETE FROM rejected_outlets WHERE id=?').bind(id).run();
+  return json({ ok: true });
 }
 
 async function handleDiscoveryStatus(runId, req, env) {
@@ -1757,10 +1811,14 @@ async function handleDiscoveryAdd(runId, req, env) {
 // ── /discover page ────────────────────────────────────────────
 async function discoverPage(req, env) {
   const runs = await env.DB.prepare('SELECT * FROM discovery_runs ORDER BY created_at DESC LIMIT 10').all().then(r => r.results || []);
+  const rej = await loadRejected(env);
+  const rejectedRows = await env.DB.prepare('SELECT id, name, publication, email, reason FROM rejected_outlets ORDER BY created_at DESC LIMIT 300').all().then(r => r.results || []);
   const runCards = runs.map(r => {
     const cands = r.results ? JSON.parse(r.results) : [];
-    const cardsHtml = cands.map((c, i) => `
-<div class="pitch-card" style="${c.added ? 'opacity:.55' : ''}">
+    const cardsHtml = cands.map((c, i) => {
+      const blocked = c.rejected || isRejected(rej, c.name, c.publication, c.email);
+      return `
+<div class="pitch-card" style="${c.added ? 'opacity:.55' : blocked ? 'opacity:.4' : ''}">
   <div class="pitch-card-header">
     <div class="pitch-card-meta">
       <span class="pitch-journalist">${esc(c.name)}</span>
@@ -1775,9 +1833,12 @@ async function discoverPage(req, env) {
   </div>
   <div class="pitch-actions">
     ${c.added ? '<span style="color:var(--green);font-size:13px;font-weight:600">✓ In roster</span>'
-      : `<button class="btn btn-green btn-sm" onclick="addCandidate('${r.id}', ${i}, this)">Add to Roster</button>`}
+      : blocked ? '<span style="color:var(--dim);font-size:13px;font-weight:600">✕ Not a fit</span>'
+      : `<button class="btn btn-green btn-sm" onclick="addCandidate('${r.id}', ${i}, this)">Add to Roster</button>
+         <button class="btn btn-ghost btn-sm" onclick="rejectCandidate('${r.id}', ${i}, this)">Not a fit</button>`}
   </div>
-</div>`).join('');
+</div>`;
+    }).join('');
     return `
 <div class="card" style="margin-bottom:20px">
   <div style="display:flex;justify-content:space-between;align-items:baseline;flex-wrap:wrap;gap:8px">
@@ -1818,6 +1879,17 @@ async function discoverPage(req, env) {
     <div class="status-line" id="dstatus" style="margin-top:8px"></div>
   </div>
   ${runCards}
+  ${rejectedRows.length ? `
+  <details style="margin-top:8px">
+    <summary style="cursor:pointer;color:var(--dim);font-size:13px;font-weight:600">✕ Not-a-fit blocklist (${rejectedRows.length}) — never re-surfaced by discovery</summary>
+    <div class="card" style="margin-top:12px">
+      ${rejectedRows.map(x => `
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;padding:6px 0;border-bottom:1px solid var(--border)">
+        <div><span style="font-weight:600">${esc(x.name || '')}</span> <span class="muted">${esc(x.publication || '')}${x.reason ? ' · ' + esc(x.reason) : ''}</span></div>
+        <button class="btn btn-ghost btn-sm" onclick="unreject('${x.id}', this)">Un-block</button>
+      </div>`).join('')}
+    </div>
+  </details>` : ''}
 </div>
 <script>
 document.getElementById('discoverForm').addEventListener('submit', function(e) {
@@ -1843,8 +1915,24 @@ function addCandidate(runId, index, btn) {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ index: index })
   }).then(function(r) { return r.json(); }).then(function(d) {
-    if (d.ok) { btn.outerHTML = '<span style="color:var(--green);font-size:13px;font-weight:600">✓ In roster</span>'; }
+    if (d.ok) { btn.parentNode.innerHTML = '<span style="color:var(--green);font-size:13px;font-weight:600">✓ In roster</span>'; }
     else { btn.disabled = false; btn.textContent = 'Add to Roster'; }
+  });
+}
+function rejectCandidate(runId, index, btn) {
+  btn.disabled = true; btn.textContent = 'Blocking…';
+  fetch('/api/discovery/' + runId + '/reject', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ index: index })
+  }).then(function(r) { return r.json(); }).then(function(d) {
+    if (d.ok) { btn.parentNode.innerHTML = '<span style="color:var(--dim);font-size:13px;font-weight:600">✕ Not a fit</span>'; btn.closest('.pitch-card').style.opacity = '.4'; }
+    else { btn.disabled = false; btn.textContent = 'Not a fit'; }
+  });
+}
+function unreject(id, btn) {
+  btn.disabled = true; btn.textContent = '…';
+  fetch('/api/rejected/' + id, { method: 'DELETE' }).then(function(r) { return r.json(); }).then(function(d) {
+    if (d.ok) { btn.closest('div').remove(); } else { btn.disabled = false; btn.textContent = 'Un-block'; }
   });
 }
 </script>`;
@@ -1857,7 +1945,7 @@ function addCandidate(runId, index, btn) {
 
 export default {
   async fetch(req, env) {
-    const eeBlocked = await eeGate(req, env, [/^\/api\/webhook\/resend$/, /^\/api\/health$/, /^\/api\/import$/, /^\/api\/roster$/, /^\/api\/persona$/, /^\/api\/discover$/, /^\/api\/discovery\//]);
+    const eeBlocked = await eeGate(req, env, [/^\/api\/webhook\/resend$/, /^\/api\/health$/, /^\/api\/import$/, /^\/api\/roster$/, /^\/api\/persona$/, /^\/api\/discover$/, /^\/api\/discovery\//, /^\/api\/rejected/]);
     if (eeBlocked) return eeBlocked;
 
     // Validate required secrets at startup
@@ -1893,6 +1981,11 @@ export default {
     if (discoveryStatusMatch && method === 'GET') return handleDiscoveryStatus(discoveryStatusMatch[1], req, env);
     const discoveryAddMatch = path.match(/^\/api\/discovery\/([^/]+)\/add$/);
     if (discoveryAddMatch && method === 'POST') return handleDiscoveryAdd(discoveryAddMatch[1], req, env);
+    const discoveryRejectMatch = path.match(/^\/api\/discovery\/([^/]+)\/reject$/);
+    if (discoveryRejectMatch && method === 'POST') return handleDiscoveryReject(discoveryRejectMatch[1], req, env);
+    if (path === '/api/rejected' && method === 'GET') return handleRejectedList(req, env);
+    const rejectedDeleteMatch = path.match(/^\/api\/rejected\/([^/]+)$/);
+    if (rejectedDeleteMatch && method === 'DELETE') return handleRejectedDelete(rejectedDeleteMatch[1], req, env);
     if (path === '/api/interview' && method === 'POST') return handleInterview(req, env);
 
     const briefStatusMatch = path.match(/^\/api\/briefs\/([^/]+)\/status$/);

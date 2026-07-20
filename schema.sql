@@ -22,6 +22,16 @@ CREATE TABLE IF NOT EXISTS journalists (
   contact_url TEXT -- pitch/contact page when no email is published
 );
 
+CREATE TABLE IF NOT EXISTS rejected_outlets (
+  id TEXT PRIMARY KEY,
+  name TEXT,
+  publication TEXT,
+  email TEXT,
+  reason TEXT, -- 'not a fit' | 'removed from roster' | custom
+  created_at INTEGER
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_rejected_key ON rejected_outlets (lower(name), lower(coalesce(publication,'')));
+
 CREATE TABLE IF NOT EXISTS discovery_runs (
   id TEXT PRIMARY KEY,
   query TEXT NOT NULL,
