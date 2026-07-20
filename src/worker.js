@@ -1682,6 +1682,36 @@ async function handleDiscover(req, env) {
   return json({ ok: true, runId });
 }
 
+// Off-worker research lands here: an agent (with no time limit) does the web
+// search and POSTs a fully-formed candidate set, which we store as a COMPLETE
+// discovery_runs row for review on /discover — same shape the in-worker path
+// produced, so the review + add-to-roster UI is unchanged. This decouples the
+// slow multi-minute search from the Worker's request/queue time budget.
+async function handleDiscoveryIngest(req, env) {
+  if (!await discoveryAuthed(req, env)) return json({ error: 'Unauthorized' }, 401);
+  let p;
+  try { p = await req.json(); } catch { return json({ error: 'Invalid JSON body' }, 400); }
+  const query = (p.query || '').trim();
+  const outletType = ['journalist', 'blog', 'podcast'].includes(p.outlet_type) ? p.outlet_type : 'podcast';
+  const raw = Array.isArray(p.candidates) ? p.candidates : [];
+  if (!query || !raw.length) return json({ error: 'query and non-empty candidates[] are required' }, 400);
+  const candidates = raw
+    .filter(c => c && c.name && c.publication)
+    .map(c => ({
+      name: String(c.name), publication: String(c.publication),
+      url: c.url || null, email: c.email || null, contact_url: c.contact_url || null,
+      beats: Array.isArray(c.beats) ? c.beats.filter(b => KNOWN_BEATS.includes(b)) : [],
+      why_fit: c.why_fit || '', added: false,
+    }));
+  if (!candidates.length) return json({ error: 'no valid candidates (each needs name + publication)' }, 400);
+  const runId = uid();
+  await env.DB.prepare(
+    'INSERT INTO discovery_runs (id, query, outlet_type, market, status, results, created_at) VALUES (?,?,?,?,?,?,?)'
+  ).bind(runId, query, outletType, p.market || null, 'complete', JSON.stringify(candidates), now()).run();
+  const origin = new URL(req.url).origin;
+  return json({ ok: true, runId, count: candidates.length, reviewUrl: `${origin}/discover` });
+}
+
 async function handleDiscoveryStatus(runId, req, env) {
   if (!await discoveryAuthed(req, env)) return json({ error: 'Unauthorized' }, 401);
   const run = await env.DB.prepare('SELECT * FROM discovery_runs WHERE id=?').bind(runId).first();
@@ -1858,6 +1888,7 @@ export default {
     if (path === '/api/roster' && method === 'GET') return handleRoster(req, env);
     if (path === '/api/persona' && method === 'GET') return json({ ok: true, persona: PUBLICIST_PERSONA, canonical: 'src/persona.js (condensation of ~/.claude/skills/publicist/SKILL.md)' });
     if (path === '/api/discover' && method === 'POST') return handleDiscover(req, env);
+    if (path === '/api/discovery/ingest' && method === 'POST') return handleDiscoveryIngest(req, env);
     const discoveryStatusMatch = path.match(/^\/api\/discovery\/([^/]+)$/);
     if (discoveryStatusMatch && method === 'GET') return handleDiscoveryStatus(discoveryStatusMatch[1], req, env);
     const discoveryAddMatch = path.match(/^\/api\/discovery\/([^/]+)\/add$/);
