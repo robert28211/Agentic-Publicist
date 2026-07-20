@@ -1495,7 +1495,7 @@ Return: ["question 1", "question 2", ...]`;
 // back into content blocks so the pause_turn resume loop still works,
 // then concatenate ALL text blocks (search responses interleave text
 // with web_search_tool_result blocks).
-async function streamClaudeOnce(body, env) {
+async function streamClaudeOnce(body, env, signal) {
   const res = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
     headers: {
@@ -1504,6 +1504,7 @@ async function streamClaudeOnce(body, env) {
       'anthropic-version': '2023-06-01',
     },
     body: JSON.stringify({ ...body, stream: true }),
+    signal,
   });
   if (!res.ok) {
     const err = await res.text();
@@ -1550,26 +1551,46 @@ async function streamClaudeOnce(body, env) {
 async function callClaudeSearch(userPrompt, systemText, env, maxTokens = 4000) {
   let messages = [{ role: 'user', content: userPrompt }];
   const tools = [
-    { type: 'web_search_20260209', name: 'web_search', max_uses: 6 },
-    { type: 'web_fetch_20260209', name: 'web_fetch', max_uses: 4 },
+    { type: 'web_search_20260209', name: 'web_search', max_uses: 10 },
+    { type: 'web_fetch_20260209', name: 'web_fetch', max_uses: 3 },
   ];
-  for (let turn = 0; turn < 6; turn++) {
-    const data = await streamClaudeOnce({
-      model: 'claude-sonnet-5',
-      max_tokens: maxTokens,
-      thinking: { type: 'disabled' },
-      system: systemText,
-      tools,
-      messages,
-    }, env);
-    if (data.stop_reason === 'pause_turn') {
-      // Server-side tool loop paused — append assistant turn and resume.
-      messages = [...messages, { role: 'assistant', content: data.content }];
-      continue;
+  // Hard deadline so a stalled SSE stream can NEVER hang the queue consumer.
+  // On timeout the fetch aborts → this throws → processDiscovery stores the
+  // error and ACKs, freeing the single queue slot for the next run.
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 280000); // 280s anti-hang backstop; normal run is ~2-4min
+  let forced = false;
+  try {
+    for (let turn = 0; turn < 6; turn++) {
+      const data = await streamClaudeOnce({
+        model: 'claude-sonnet-5',
+        max_tokens: maxTokens,
+        thinking: { type: 'disabled' },
+        system: systemText,
+        tools,
+        messages,
+      }, env, controller.signal);
+      if (data.stop_reason === 'pause_turn') {
+        // Server-side tool loop paused — append assistant turn and resume.
+        messages = [...messages, { role: 'assistant', content: data.content }];
+        continue;
+      }
+      const text = (data.content || []).filter(b => b.type === 'text').map(b => b.text).join('\n');
+      if (text.includes('[') || forced) return text;
+      // The model ended its turn WITHOUT a JSON array — this happens when it
+      // burns its search budget and then narrates "I've hit the search limit,
+      // tell me to continue" instead of synthesizing. Force one final turn that
+      // outputs ONLY the JSON of what it already found.
+      messages = [...messages,
+        { role: 'assistant', content: data.content },
+        { role: 'user', content: 'Stop searching now. Output ONLY the raw JSON array of the real, verified outlets you have found so far — no prose, no markdown fences, no questions, no offers to continue. If you genuinely found none, output []. This is your final answer.' },
+      ];
+      forced = true;
     }
-    return (data.content || []).filter(b => b.type === 'text').map(b => b.text).join('\n');
+    throw new Error('Search loop did not complete after 6 turns');
+  } finally {
+    clearTimeout(timer);
   }
-  throw new Error('Search loop did not complete after 6 turns');
 }
 
 async function processDiscovery(message, env) {
@@ -1589,11 +1610,13 @@ async function processDiscovery(message, env) {
 Your current task: media-outlet DISCOVERY, not pitching. Using web search, find REAL, currently-active ${outletLabel} relevant to the topic and market below. This roster will be used for actual outreach, so accuracy beats volume.
 
 Hard rules:
+- Search EFFICIENTLY: run broad searches (2-4 of them) to gather candidates, then STOP searching and synthesize. Do not do one narrow search at a time. When you have enough to name 5-7 real outlets — or if you approach the search limit — immediately STOP and output the JSON. NEVER end your turn by saying you've hit a search limit or asking to "continue"/"retry": synthesize what you already have into the JSON array instead.
+- Your FINAL message must be the raw JSON array and nothing else — no preamble, no narration, no questions.
 - ONLY report outlets you actually verified exist via your search/fetch results. NEVER invent a show, blog, publication, host, or email. A wrong contact poisons the roster.
 - For each: find the host/author/reporter NAME, the outlet name, its URL, and the best CONTACT PATH (an email if one is published, else the contact/pitch page URL).
 - Prefer outlets that actively accept guests/pitches and have published recently (within ~6 months).
 - Assign 1-3 beats from exactly this list: marketing-tech, home-services, ai-automation, flooring-industry, small-business, digital-marketing, construction, sc-local, local-business.
-- 5-10 strong candidates beat 20 weak ones.
+- Return AT MOST 7 candidates — the strongest, not the most. Keep each "why_fit" to ONE tight sentence (~20 words), no padding.
 - Return ONLY a raw JSON array, no markdown fences, in this shape:
 [{"name":"host or author name","publication":"outlet name","url":"https://...","email":"...or null","contact_url":"...or null","beats":["small-business"],"why_fit":"1-2 sentences: why this outlet fits the topic + evidence it's active"}]`;
 
@@ -1602,9 +1625,9 @@ Market: ${run.market || 'United States (no specific city)'}
 Outlet type: ${run.outlet_type}`;
 
   try {
-    const text = await callClaudeSearch(user, system, env, 4000);
+    const text = await callClaudeSearch(user, system, env, 8000);
     const match = text.match(/\[[\s\S]*\]/);
-    if (!match) throw new Error('No JSON array in discovery output');
+    if (!match) throw new Error(`No JSON array. len=${text.length} hasBracket=${text.includes('[')} HEAD>>${text.slice(0, 900)}<<TAIL>>${text.slice(-400)}`);
     const candidates = JSON.parse(match[0])
       .filter(c => c && c.name && c.publication)
       .map(c => ({
@@ -1618,9 +1641,16 @@ Outlet type: ${run.outlet_type}`;
     await message.ack();
     await telegram(`🔎 <b>Discovery complete</b>\n${candidates.length} ${run.outlet_type} candidates for "${run.query.slice(0, 60)}"\nReview at publicist.engageengine.ai/discover`, env);
   } catch (err) {
+    const msg = String((err && err.message) || err);
     await db.prepare("UPDATE discovery_runs SET status='error', error=? WHERE id=?")
-      .bind(String((err && err.message) || err).slice(0, 500), discoveryId).run();
-    throw err; // let CF retry
+      .bind(msg.slice(0, 2000), discoveryId).run();
+    // ACK (do not throw) on deterministic failures — a bad/oversized JSON parse
+    // will fail identically on retry, and with max_batch_size=1 a retry-storming
+    // message starves sibling discovery runs into permanent 'pending'. Only let
+    // genuinely transient upstream errors (5xx/524/network) retry.
+    const transient = /\b(5\d\d|524|timeout|network|ECONN|fetch failed)\b/i.test(msg);
+    if (transient) throw err; // transient → let CF retry
+    await message.ack();       // deterministic → record and move on
   }
 }
 
