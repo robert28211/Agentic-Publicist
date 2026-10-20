@@ -14,6 +14,10 @@ import { PUBLICIST_PERSONA } from './persona.js';
 
 // Canonical beat names used in angle generation and journalist matching.
 // These are labels, not domain lists. The journalist DB is the source of truth.
+// Contact kinds the roster holds. 'speaking' = a speaking venue's program chair /
+// booking contact (civic clubs, associations, chambers, conferences).
+export const OUTLET_TYPES = ['journalist', 'blog', 'podcast', 'speaking'];
+
 export const KNOWN_BEATS = [
   'marketing-tech',
   'home-services',
@@ -62,6 +66,8 @@ export async function getJournalistsForBeat(beat, db) {
   const rows = await db.prepare('SELECT * FROM journalists LIMIT 200').all().then(r => r.results || []);
   return rows.filter(j => {
     try {
+      // Speaking venues get booking pitches via /api/import, never press angles.
+      if (j.outlet_type === 'speaking') return false;
       const keywords = JSON.parse(j.beat_keywords || '[]');
       return keywords.includes(beat);
     } catch {
@@ -1019,6 +1025,7 @@ async function journalistsPage(req, env) {
           <option value="journalist" selected>Journalist</option>
           <option value="blog">Blog</option>
           <option value="podcast">Podcast</option>
+          <option value="speaking">Speaking venue</option>
         </select>
       </div>
       <div style="grid-column:1/-1">
@@ -1150,7 +1157,7 @@ async function handleAddJournalist(req, env) {
   const email = (form.get('email') || '').trim().toLowerCase();
   const publication = (form.get('publication') || '').trim();
   const beats = form.getAll('beats').filter(b => KNOWN_BEATS.includes(b));
-  const outletType = ['journalist', 'blog', 'podcast'].includes(form.get('outlet_type')) ? form.get('outlet_type') : 'journalist';
+  const outletType = OUTLET_TYPES.includes(form.get('outlet_type')) ? form.get('outlet_type') : 'journalist';
 
   if (!name || !email || !publication) {
     return redirect(req, '/journalists?msg=error', 303);
@@ -1392,7 +1399,7 @@ async function handleImportPlan(req, env) {
       ).bind(
         journalistId, jr.name, jr.email || null, jr.publication || null,
         jr.beat_keywords ? JSON.stringify(jr.beat_keywords) : null,
-        ['journalist', 'blog', 'podcast'].includes(jr.outlet_type) ? jr.outlet_type : 'journalist'
+        OUTLET_TYPES.includes(jr.outlet_type) ? jr.outlet_type : 'journalist'
       ).run();
     }
     await db.prepare(
@@ -1420,7 +1427,7 @@ async function handleRoster(req, env) {
   if (!env.INGEST_TOKEN || token !== env.INGEST_TOKEN) {
     return json({ error: 'Unauthorized' }, 401);
   }
-  const typeFilter = new URL(req.url).searchParams.get('type'); // journalist | blog | podcast
+  const typeFilter = new URL(req.url).searchParams.get('type'); // journalist | blog | podcast | speaking
   const rows = typeFilter
     ? await env.DB.prepare(
         "SELECT name, email, publication, beat_keywords, outlet_type FROM journalists WHERE coalesce(outlet_type,'journalist')=? ORDER BY publication, name"
@@ -1606,7 +1613,11 @@ async function processDiscovery(message, env) {
 
   const outletLabel = run.outlet_type === 'journalist' ? 'journalists / reporters'
     : run.outlet_type === 'blog' ? 'blogs (with named authors/editors)'
+    : run.outlet_type === 'speaking' ? 'speaking venues — civic clubs, professional associations, chambers and conferences that book outside speakers (with a named program chair or booking contact where published)'
     : 'podcasts (with named hosts)';
+  const speakingRules = run.outlet_type === 'speaking'
+    ? `\n- SPEAKING VENUES: "publication" is the organization; "name" is the program chair or booking contact (use "Program chair" only if no name is published). Record the booking path EXACTLY as the organization publishes it (speaker form URL, email, or contact page). Only include groups with evidence of meetings or events in the last 12 months that take outside speakers. Put meeting cadence/location in why_fit.`
+    : '';
 
   const system = `${PUBLICIST_PERSONA}
 
@@ -1617,7 +1628,7 @@ Hard rules:
 - Your FINAL message must be the raw JSON array and nothing else — no preamble, no narration, no questions.
 - ONLY report outlets you actually verified exist via your search/fetch results. NEVER invent a show, blog, publication, host, or email. A wrong contact poisons the roster.
 - For each: find the host/author/reporter NAME, the outlet name, its URL, and the best CONTACT PATH (an email if one is published, else the contact/pitch page URL).
-- Prefer outlets that actively accept guests/pitches and have published recently (within ~6 months).
+- Prefer outlets that actively accept guests/pitches and have published recently (within ~6 months).${speakingRules}
 - Assign 1-3 beats from exactly this list: marketing-tech, home-services, ai-automation, flooring-industry, small-business, digital-marketing, construction, sc-local, local-business.
 - Return AT MOST 7 candidates — the strongest, not the most. Keep each "why_fit" to ONE tight sentence (~20 words), no padding.
 - Return ONLY a raw JSON array, no markdown fences, in this shape:
@@ -1671,7 +1682,7 @@ async function handleDiscover(req, env) {
   try { payload = await req.json(); } catch { return json({ error: 'Invalid JSON body' }, 400); }
   const query = (payload.query || '').trim();
   if (!query) return json({ error: 'query is required' }, 400);
-  const outletType = ['journalist', 'blog', 'podcast'].includes(payload.outlet_type) ? payload.outlet_type : 'podcast';
+  const outletType = OUTLET_TYPES.includes(payload.outlet_type) ? payload.outlet_type : 'podcast';
   const runId = uid();
   await env.DB.prepare(
     'INSERT INTO discovery_runs (id, query, outlet_type, market, status, created_at) VALUES (?,?,?,?,?,?)'
@@ -1716,7 +1727,7 @@ async function handleDiscoveryIngest(req, env) {
   let p;
   try { p = await req.json(); } catch { return json({ error: 'Invalid JSON body' }, 400); }
   const query = (p.query || '').trim();
-  const outletType = ['journalist', 'blog', 'podcast'].includes(p.outlet_type) ? p.outlet_type : 'podcast';
+  const outletType = OUTLET_TYPES.includes(p.outlet_type) ? p.outlet_type : 'podcast';
   const raw = Array.isArray(p.candidates) ? p.candidates : [];
   if (!query || !raw.length) return json({ error: 'query and non-empty candidates[] are required' }, 400);
   const rej = await loadRejected(env);
@@ -1867,6 +1878,7 @@ async function discoverPage(req, env) {
           <option value="podcast" selected>Podcasts</option>
           <option value="blog">Blogs</option>
           <option value="journalist">Journalists</option>
+          <option value="speaking">Speaking venues</option>
         </select>
       </div>
       <div class="form-group" style="margin:0">
