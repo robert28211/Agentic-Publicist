@@ -1616,7 +1616,7 @@ async function processDiscovery(message, env) {
     : run.outlet_type === 'speaking' ? 'speaking venues — civic clubs, professional associations, chambers and conferences that book outside speakers (with a named program chair or booking contact where published)'
     : 'podcasts (with named hosts)';
   const speakingRules = run.outlet_type === 'speaking'
-    ? `\n- SPEAKING VENUES: "publication" is the organization; "name" is the program chair or booking contact (use "Program chair" only if no name is published). Record the booking path EXACTLY as the organization publishes it (speaker form URL, email, or contact page). Only include groups with evidence of meetings or events in the last 12 months that take outside speakers. Put meeting cadence/location in why_fit.`
+    ? `\n- SPEAKING VENUES: for this run an "outlet" is an ORGANIZATION that hosts speakers (Rotary/Kiwanis/civic club, professional association chapter, chamber, conference) — not a media outlet. "publication" = the organization; "name" = the program chair or booking contact, or "Program chair" if none is published. Contact path = the speaker form, email, or contact page exactly as the organization publishes it. Prefer groups with a meeting or event in the last 12 months; put meeting cadence/location in why_fit. Return what you find — an empty array only if you truly found no such organization.`
     : '';
 
   const system = `${PUBLICIST_PERSONA}
