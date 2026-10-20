@@ -7,7 +7,8 @@ CREATE TABLE IF NOT EXISTS entities (
   type TEXT NOT NULL, -- personal | agency | product
   bio_short TEXT,
   bio_long TEXT,
-  expertise_keywords TEXT -- JSON array of strings
+  expertise_keywords TEXT, -- JSON array of strings
+  home_market TEXT -- e.g. 'Columbia, SC'. Briefcase Rule: contacts within 50 mi rank last
 );
 
 CREATE TABLE IF NOT EXISTS journalists (
@@ -37,6 +38,7 @@ CREATE TABLE IF NOT EXISTS discovery_runs (
   query TEXT NOT NULL,
   outlet_type TEXT DEFAULT 'podcast', -- journalist | blog | podcast | speaking
   market TEXT,
+  home_market TEXT, -- subject's home market; candidates within 50 mi flagged home and ranked last
   status TEXT DEFAULT 'pending', -- pending | processing | complete | error
   results TEXT, -- JSON array of candidates (with added:bool per candidate)
   error TEXT,

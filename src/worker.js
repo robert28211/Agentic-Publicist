@@ -18,6 +18,23 @@ import { PUBLICIST_PERSONA } from './persona.js';
 // booking contact (civic clubs, associations, chambers, conferences).
 export const OUTLET_TYPES = ['journalist', 'blog', 'podcast', 'speaking'];
 
+// THE BRIEFCASE RULE (Robbie's): "An expert is a man 50 miles away from home
+// with a briefcase." — Will Rogers. Contacts within this radius of the
+// subject's home market are HOME: still shown, always ranked last.
+export const BRIEFCASE_MILES = 50;
+
+// Normalize a discovery candidate's distance fields and rank HOME last
+// (stable: order within each group is preserved).
+export function briefcaseRank(cands) {
+  const norm = cands.map(c => {
+    const d = Number(c.distance_miles);
+    const distance_miles = Number.isFinite(d) && d >= 0 ? Math.round(d) : null;
+    const home = c.home === true || (distance_miles !== null && distance_miles < BRIEFCASE_MILES);
+    return { ...c, distance_miles, home };
+  });
+  return [...norm.filter(c => !c.home), ...norm.filter(c => c.home)];
+}
+
 export const KNOWN_BEATS = [
   'marketing-tech',
   'home-services',
@@ -191,9 +208,12 @@ Rules:
 - Write in first person as if from ${entity.name}
 - Return valid JSON only`;
 
+  const homeRule = entity.home_market
+    ? `\n\nBriefcase Rule: ${entity.name}'s home market is ${entity.home_market}. If this outlet is based in or within ${BRIEFCASE_MILES} miles of it, lead with OUTSIDE proof (where else they've been featured, spoken or been recognized, as given in the brief), not their résumé — a prophet is not honored in their own land. If the outlet is farther away, present ${entity.name} as the visiting expert.`
+    : '';
   const system = `${PUBLICIST_PERSONA}
 
-${taskRules}`;
+${taskRules}${homeRule}`;
 
   const user = `${isGuestPitch ? 'Host' : 'Journalist'}: ${journalist.name}, ${journalist.publication}
 Their recent ${isGuestPitch ? 'episode/post' : 'article'}: "${articleTitle}" — ${articleSnippet || 'recent coverage'}
@@ -1360,14 +1380,18 @@ async function handleImportPlan(req, env) {
   let entityId;
   if (entityRow) {
     entityId = entityRow.id;
+    if (ent.home_market) {
+      await db.prepare('UPDATE entities SET home_market=? WHERE id=?').bind(String(ent.home_market), entityId).run();
+    }
   } else {
     entityId = ent.id || uid();
     await db.prepare(
-      'INSERT INTO entities (id, name, type, bio_short, bio_long, expertise_keywords) VALUES (?,?,?,?,?,?)'
+      'INSERT INTO entities (id, name, type, bio_short, bio_long, expertise_keywords, home_market) VALUES (?,?,?,?,?,?,?)'
     ).bind(
       entityId, ent.name, ent.type || 'client',
       ent.bio_short || null, ent.bio_long || null,
-      ent.expertise_keywords ? JSON.stringify(ent.expertise_keywords) : null
+      ent.expertise_keywords ? JSON.stringify(ent.expertise_keywords) : null,
+      ent.home_market || null
     ).run();
   }
 
@@ -1634,22 +1658,26 @@ Hard rules:
 - Return ONLY a raw JSON array, no markdown fences, in this shape:
 [{"name":"host or author name","publication":"outlet name","url":"https://...","email":"...or null","contact_url":"...or null","beats":["small-business"],"why_fit":"1-2 sentences: why this outlet fits the topic + evidence it's active"}]`;
 
+  const briefcase = run.home_market
+    ? `\n\nBRIEFCASE RULE — "An expert is a man 50 miles away from home with a briefcase." The subject's HOME market is ${run.home_market}. Prioritize outlets based MORE than ${BRIEFCASE_MILES} miles from it, plus national/virtual outlets with no fixed location. Home-market outlets may still be included but are lower priority. For EVERY candidate add "distance_miles": approximate straight-line miles from ${run.home_market} to where the outlet is based (null if national, virtual, or no fixed location), and "home": true if it is within ${BRIEFCASE_MILES} miles, else false.`
+    : '';
   const user = `Topic / who we're pitching: ${run.query}
-Market: ${run.market || 'United States (no specific city)'}
-Outlet type: ${run.outlet_type}`;
+Market: ${run.market || (run.home_market ? `regional and national — outside ${BRIEFCASE_MILES} miles of ${run.home_market}` : 'United States (no specific city)')}
+Outlet type: ${run.outlet_type}${briefcase}`;
 
   try {
     const text = await callClaudeSearch(user, system, env, 8000);
     const match = text.match(/\[[\s\S]*\]/);
     if (!match) throw new Error(`No JSON array. len=${text.length} hasBracket=${text.includes('[')} HEAD>>${text.slice(0, 900)}<<TAIL>>${text.slice(-400)}`);
-    const candidates = JSON.parse(match[0])
+    const candidates = briefcaseRank(JSON.parse(match[0])
       .filter(c => c && c.name && c.publication)
       .map(c => ({
         name: String(c.name), publication: String(c.publication),
         url: c.url || null, email: c.email || null, contact_url: c.contact_url || null,
         beats: Array.isArray(c.beats) ? c.beats.filter(b => KNOWN_BEATS.includes(b)) : [],
         why_fit: c.why_fit || '', added: false,
-      }));
+        distance_miles: c.distance_miles, home: c.home,
+      })));
     await db.prepare("UPDATE discovery_runs SET status='complete', results=?, error=NULL WHERE id=?")
       .bind(JSON.stringify(candidates), discoveryId).run();
     await message.ack();
@@ -1676,6 +1704,15 @@ async function discoveryAuthed(req, env) {
   return eeValid(env, eeCookie(req, 'ee_session'));
 }
 
+// home_market for a discovery run: explicit, else from the named entity.
+async function resolveHomeMarket(p, env) {
+  if (p.home_market) return String(p.home_market).trim() || null;
+  const key = p.entity_id || p.entity;
+  if (!key) return null;
+  const row = await env.DB.prepare('SELECT home_market FROM entities WHERE id=? OR lower(name)=lower(?)').bind(key, key).first();
+  return (row && row.home_market) || null;
+}
+
 async function handleDiscover(req, env) {
   if (!await discoveryAuthed(req, env)) return json({ error: 'Unauthorized' }, 401);
   let payload;
@@ -1685,8 +1722,8 @@ async function handleDiscover(req, env) {
   const outletType = OUTLET_TYPES.includes(payload.outlet_type) ? payload.outlet_type : 'podcast';
   const runId = uid();
   await env.DB.prepare(
-    'INSERT INTO discovery_runs (id, query, outlet_type, market, status, created_at) VALUES (?,?,?,?,?,?)'
-  ).bind(runId, query, outletType, payload.market || null, 'pending', now()).run();
+    'INSERT INTO discovery_runs (id, query, outlet_type, market, status, created_at, home_market) VALUES (?,?,?,?,?,?,?)'
+  ).bind(runId, query, outletType, payload.market || null, 'pending', now(), await resolveHomeMarket(payload, env)).run();
   try {
     await env.PIPELINE_QUEUE.send({ discoveryId: runId });
   } catch {
@@ -1738,13 +1775,15 @@ async function handleDiscoveryIngest(req, env) {
       url: c.url || null, email: c.email || null, contact_url: c.contact_url || null,
       beats: Array.isArray(c.beats) ? c.beats.filter(b => KNOWN_BEATS.includes(b)) : [],
       why_fit: c.why_fit || '', added: false,
+      distance_miles: c.distance_miles, home: c.home,
     }))
     .filter(c => !isRejected(rej, c.name, c.publication, c.email)); // drop blocklisted
+  const ranked = briefcaseRank(candidates);
   if (!candidates.length) return json({ ok: true, runId: null, count: 0, note: 'all candidates were valid-empty or on the blocklist' });
   const runId = uid();
   await env.DB.prepare(
-    'INSERT INTO discovery_runs (id, query, outlet_type, market, status, results, created_at) VALUES (?,?,?,?,?,?,?)'
-  ).bind(runId, query, outletType, p.market || null, 'complete', JSON.stringify(candidates), now()).run();
+    'INSERT INTO discovery_runs (id, query, outlet_type, market, status, results, created_at, home_market) VALUES (?,?,?,?,?,?,?,?)'
+  ).bind(runId, query, outletType, p.market || null, 'complete', JSON.stringify(ranked), now(), await resolveHomeMarket(p, env)).run();
   const origin = new URL(req.url).origin;
   return json({ ok: true, runId, count: candidates.length, reviewUrl: `${origin}/discover` });
 }
@@ -1783,7 +1822,7 @@ async function handleDiscoveryStatus(runId, req, env) {
   if (!run) return json({ error: 'Not found' }, 404);
   return json({
     ok: true, id: run.id, status: run.status, query: run.query,
-    outlet_type: run.outlet_type, market: run.market, error: run.error || null,
+    outlet_type: run.outlet_type, market: run.market, home_market: run.home_market || null, error: run.error || null,
     candidates: run.results ? JSON.parse(run.results) : [],
   });
 }
@@ -1835,6 +1874,8 @@ async function discoverPage(req, env) {
       <span class="pitch-journalist">${esc(c.name)}</span>
       <span class="pitch-pub">${esc(c.publication)}</span>
       ${(c.beats || []).map(b => `<span class="pitch-angle">${esc(b)}</span>`).join(' ')}
+      ${c.home ? '<span class="pitch-angle" style="background:var(--dim);color:var(--bg)" title="Within 50 miles of home: ranked last (Briefcase Rule)">HOME</span>'
+        : (c.distance_miles != null ? `<span class="muted" style="font-size:12px">~${esc(String(c.distance_miles))} mi</span>` : '')}
     </div>
     <div class="muted" style="margin-bottom:6px">
       ${c.url ? `<a href="${esc(c.url)}" target="_blank" rel="noopener">${esc(c.url)}</a> · ` : ''}
@@ -1854,7 +1895,7 @@ async function discoverPage(req, env) {
 <div class="card" style="margin-bottom:20px">
   <div style="display:flex;justify-content:space-between;align-items:baseline;flex-wrap:wrap;gap:8px">
     <h2 style="margin:0;font-size:15px">${esc(r.query)}</h2>
-    <span class="muted">${esc(r.outlet_type)}${r.market ? ' · ' + esc(r.market) : ''} · ${r.status === 'complete' ? cands.length + ' candidates' : esc(r.status)}</span>
+    <span class="muted">${esc(r.outlet_type)}${r.market ? ' · ' + esc(r.market) : ''}${r.home_market ? ' · home: ' + esc(r.home_market) : ''} · ${r.status === 'complete' ? cands.length + ' candidates' : esc(r.status)}</span>
   </div>
   ${r.status === 'error' ? `<div class="alert alert-error" style="margin-top:10px">${esc(r.error || 'failed')}</div>` : ''}
   ${r.status === 'pending' || r.status === 'processing' ? '<div class="muted" style="margin-top:10px">Searching the web… refresh in ~1 minute.</div>' : ''}
@@ -1866,7 +1907,7 @@ async function discoverPage(req, env) {
 <div class="page-wide">
   <div class="card" style="margin-bottom:28px">
     <h2 style="font-size:15px;margin-bottom:14px">Find Outlets</h2>
-    <form id="discoverForm" style="display:grid;grid-template-columns:2fr 1fr 1fr auto;gap:12px;align-items:end">
+    <form id="discoverForm" style="display:grid;grid-template-columns:2fr 1fr 1fr 1fr auto;gap:12px;align-items:end">
       <div class="form-group" style="margin:0">
         <label>Topic / who you're pitching</label>
         <input type="text" id="dq" required placeholder="e.g. marketing podcasts that interview agency founders about local lead generation"
@@ -1884,6 +1925,11 @@ async function discoverPage(req, env) {
       <div class="form-group" style="margin:0">
         <label>Market (optional)</label>
         <input type="text" id="dm" placeholder="e.g. Columbia SC, or national"
+          style="width:100%;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:14px;padding:9px 12px;outline:none">
+      </div>
+      <div class="form-group" style="margin:0">
+        <label>Home market (Briefcase Rule)</label>
+        <input type="text" id="dh" placeholder="e.g. Columbia, SC — ranks within 50 mi last"
           style="width:100%;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:14px;padding:9px 12px;outline:none">
       </div>
       <button type="submit" class="btn btn-primary" id="dbtn">Discover</button>
@@ -1910,7 +1956,7 @@ document.getElementById('discoverForm').addEventListener('submit', function(e) {
   btn.disabled = true; btn.textContent = 'Queuing…';
   fetch('/api/discover', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ query: document.getElementById('dq').value, outlet_type: document.getElementById('dt').value, market: document.getElementById('dm').value })
+    body: JSON.stringify({ query: document.getElementById('dq').value, outlet_type: document.getElementById('dt').value, market: document.getElementById('dm').value, home_market: document.getElementById('dh').value })
   }).then(function(r) { return r.json(); }).then(function(d) {
     if (!d.ok) { document.getElementById('dstatus').textContent = d.error || 'failed'; btn.disabled = false; btn.textContent = 'Discover'; return; }
     document.getElementById('dstatus').textContent = 'Searching the web — takes ~1-2 minutes. Page will refresh.';
