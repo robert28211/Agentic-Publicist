@@ -321,14 +321,19 @@ async function sendPitchEmail(pitch, journalist, entity, env) {
 // ============================================================
 
 async function telegram(text, env) {
-  if (!env.TELEGRAM_BOT_TOKEN || !env.TELEGRAM_CHAT_ID) return;
+  await eeNotify(env, String(text).replace(/<[^>]+>/g, ""), "publicist");
+}
+
+// 2026-11-13: alerts go to Robbie's WhatsApp via the ee-notify relay (he does not read Telegram).
+// Service binding NOTIFY -> ee-notify; NOTIFY_KEY secret. Never throws.
+async function eeNotify(env, text, source) {
   try {
-    await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ chat_id: env.TELEGRAM_CHAT_ID, text, parse_mode: 'HTML' }),
-    });
-  } catch { /* non-critical */ }
+    const init = { method: "POST", headers: { "Content-Type": "application/json", "x-notify-key": env.NOTIFY_KEY || "" },
+      body: JSON.stringify({ text: String(text || "").slice(0, 6000), source }) };
+    const r = env.NOTIFY ? await env.NOTIFY.fetch("https://ee-notify/send", init)
+                         : await fetch("https://ee-notify.robertlbutt.workers.dev/send", init);
+    return r.ok ? "ok" : `http ${r.status}`;
+  } catch (e) { return `error: ${e.message}`; }
 }
 
 // ============================================================

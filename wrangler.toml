@@ -44,3 +44,7 @@ APP_ENV = "production"
 # Cloudflare Access protects all routes at the account level.
 # Configure in Zero Trust dashboard → Access → Applications → Add application.
 # No auth code needed in the Worker.
+
+[[services]]
+binding = "NOTIFY"
+service = "ee-notify"
